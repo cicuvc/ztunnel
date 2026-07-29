@@ -2,8 +2,9 @@ mod config;
 mod proxy;
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use clap::Parser;
 use zt_common::token::{self, TokenPurpose};
 
@@ -142,6 +143,7 @@ fn temp_known_hosts(hostname: &str, pubkey: &str) -> anyhow::Result<PathBuf> {
     // ssh reads it after this function returns (we exec ssh).  The OS /tmp
     // cleaner or the next invocation handles cleanup.
     let mut f = std::fs::File::create(&tmp)?;
+    #[cfg(unix)]
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     writeln!(f, "{} {}", hostname, pubkey)?;
     Ok(tmp)

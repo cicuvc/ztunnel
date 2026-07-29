@@ -149,7 +149,9 @@ fn load_secret() -> Result<Vec<u8>, String> {
 }
 
 fn secret_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".config").join("ztunnel").join("secret")
 }
 

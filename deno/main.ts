@@ -1,8 +1,8 @@
 import { verify, currentWindow } from "./lib/auth.ts";
 
 const STALE_SECS = 90;
-
-let _endpoint: Record<string, unknown> | null = null;
+const KV_KEY = ["zt", "endpoint"];
+let _kv: Deno.Kv | null = null;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -18,9 +18,21 @@ function timeAgo(ts: number): string {
   return `${Math.floor(secs / 3600)}h ago`;
 }
 
-function statusPage(): Response {
+async function getEndpoint(): Promise<Record<string, unknown> | null> {
+  if (!_kv) return null;
+  const result = await _kv.get<Record<string, unknown>>(KV_KEY);
+  return result.value;
+}
+
+async function setEndpoint(record: Record<string, unknown>): Promise<void> {
+  if (!_kv) return;
+  await _kv.set(KV_KEY, record);
+}
+
+async function statusPage(): Promise<Response> {
   const now = Math.floor(Date.now() / 1000);
-  const stale = _endpoint ? (now - (_endpoint.ts as number)) > STALE_SECS : true;
+  const endpoint = await getEndpoint();
+  const stale = endpoint ? (now - (endpoint.ts as number)) > STALE_SECS : true;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -29,21 +41,21 @@ function statusPage(): Response {
 <style>
   body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2em auto; padding: 0 1em; }
   h1 { color: #333; }
+  .meta { color: #666; font-size: 0.9em; }
   .status { display: inline-block; padding: 0.25em 0.75em; border-radius: 4px; font-weight: bold; }
   .active { background: #d4edda; color: #155724; }
   .down { background: #f8d7da; color: #721c24; }
   .stale { background: #fff3cd; color: #856404; }
-  .meta { color: #666; font-size: 0.9em; }
 </style>
 </head>
 <body>
 <h1>ztunnel registry</h1>
-${_endpoint ? `
-<p>Status: <span class="status ${_endpoint.status}">${String(_endpoint.status)}</span>
+${endpoint ? `
+<p>Status: <span class="status ${endpoint.status}">${String(endpoint.status)}</span>
 ${stale ? ' <span class="status stale">stale</span>' : ''}</p>
-<p>Endpoint: <code>${String(_endpoint.ip)}:${_endpoint.port}</code></p>
-<p class="meta">Last heartbeat: ${timeAgo(_endpoint.ts as number)}</p>
-<p class="meta">nat_type_suspect: ${_endpoint.nat_type_suspect ? "yes" : "no"}</p>
+<p>Endpoint: <code>${String(endpoint.ip)}:${endpoint.port}</code></p>
+<p class="meta">Last heartbeat: ${timeAgo(endpoint.ts as number)}</p>
+<p class="meta">nat_type_suspect: ${endpoint.nat_type_suspect ? "yes" : "no"}</p>
 ` : `
 <p>No endpoint registered yet.</p>
 `}
@@ -77,7 +89,7 @@ async function handleRegister(req: Request, secret: string): Promise<Response> {
     return json({ error: "missing required fields" }, 400);
   }
 
-  _endpoint = {
+  const record = {
     ip,
     port,
     ts,
@@ -86,6 +98,7 @@ async function handleRegister(req: Request, secret: string): Promise<Response> {
     nat_type_suspect: !!body.nat_type_suspect,
   };
 
+  await setEndpoint(record);
   return json({ ok: true });
 }
 
@@ -107,17 +120,26 @@ async function handleEndpoint(req: Request, secret: string): Promise<Response> {
     return json({ error: "unauthorized" }, 401);
   }
 
-  if (!_endpoint) {
+  const endpoint = await getEndpoint();
+  if (!endpoint) {
     return json({ error: "no endpoint registered" }, 404);
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const stale = (now - (_endpoint.ts as number)) > STALE_SECS;
+  const stale = (now - (endpoint.ts as number)) > STALE_SECS;
 
-  return json({ ..._endpoint, stale });
+  return json({ ...endpoint, stale });
 }
 
 async function handler(req: Request): Promise<Response> {
+  if (!_kv) {
+    try {
+      _kv = await Deno.openKv();
+    } catch {
+      return json({ error: "kv not available" }, 500);
+    }
+  }
+
   const secret = Deno.env.get("ZT_SECRET");
   if (!secret) {
     return json({ error: "server misconfigured" }, 500);
@@ -140,7 +162,7 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
-  // GET /api?cmd=time → server timestamp (for clock sync)
+  // GET /api?cmd=time → server timestamp
   if (url.searchParams.get("cmd") === "time") {
     return json({ ts: Math.floor(Date.now() / 1000) });
   }

@@ -6,7 +6,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+// NAT TCP mapping idle timeout is ~5-8s.  Keepalive must fire before that.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const INITIAL_RETRY: Duration = Duration::from_millis(300);
 const MAX_RETRY: Duration = Duration::from_secs(5);
 
@@ -32,7 +33,8 @@ pub async fn spawn_hairpin_keepalive(
 
         match TcpStream::connect(public_addr).await {
             Ok(mut stream) => {
-                // Gate recognizes this line and closes silently without counting as failure.
+                // SYN-ACK from the listener port (2222) refreshes the NAT mapping.
+                // Gate recognizes ZTKEEPALIVE1 and drops silently (no ban count).
                 if let Err(e) = stream.write_all(b"ZTKEEPALIVE1\n").await {
                     debug!(error = %e, "keepalive write failed");
                 }

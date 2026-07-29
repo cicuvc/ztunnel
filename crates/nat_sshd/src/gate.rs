@@ -52,8 +52,8 @@ impl Gate {
         if let Some(ip) = ip {
             match result {
                 Err(()) => self.record_failure(ip).await,
-                Ok(true) => self.clear_failures(ip).await, // successful auth — reset ban count
-                Ok(false) => {} // keepalive — no action
+                Ok(true) => self.clear_failures(ip).await,
+                Ok(false) => {}
             }
         }
     }
@@ -64,17 +64,15 @@ impl Gate {
             let mut reader = BufReader::new(&mut stream);
             timeout(READ_TIMEOUT, reader.read_line(&mut line))
                 .await
-                .map_err(|_| {
-                    debug!("gate read timeout");
-                })?
-                .map_err(|e| {
-                    debug!(error = %e, "gate read error");
-                })?;
+                .map_err(|_| debug!("gate read timeout"))?
+                .map_err(|e| debug!(error = %e, "gate read error"))?;
         }
 
         let line = line.trim();
 
         if line == "ZTKEEPALIVE1" {
+            // Keepalive probe: TCP handshake already refreshed the NAT mapping.
+            // Close silently and do NOT count as a failed auth.
             debug!("keepalive probe, closing silently");
             return Ok(false);
         }
@@ -117,9 +115,6 @@ impl Gate {
         };
 
         let token = parts[2];
-        // Gate token window is provided by the client, not dependent on local clock.
-        // The time_offset is logged for diagnostics but not used in verification,
-        // since the client sends the window it used to generate the token.
         token::verify(&self.secret, TokenPurpose::Gate, token, window)
     }
 

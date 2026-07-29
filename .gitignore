@@ -6,3 +6,5 @@ node_modules/
 research/cbot/
 research/backups/
 .vercel
+deno.txt
+.env.local

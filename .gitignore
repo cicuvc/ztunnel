@@ -1,0 +1,7 @@
+cf_auth.txt
+vercel.txt
+target/
+node_modules/
+.vercel/
+research/cbot/
+research/backups/

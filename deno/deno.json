@@ -1,0 +1,11 @@
+{
+  "tasks": {
+    "start": "deno run -A main.ts"
+  },
+  "deploy": {
+    "org": "cicuvc",
+    "app": "ztunnel"
+  }
+}
+
+

@@ -1,0 +1,7 @@
+{
+  "deploy": {
+    "org": "cicuvc",
+    "app": "ztunnel"
+  }
+}
+

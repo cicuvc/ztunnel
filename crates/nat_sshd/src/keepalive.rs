@@ -1,0 +1,53 @@
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const INITIAL_RETRY: Duration = Duration::from_millis(300);
+const MAX_RETRY: Duration = Duration::from_secs(5);
+const KEEPALIVE_BYTE: &[u8] = b"\x00";
+
+pub async fn spawn_hairpin_keepalive(
+    public_addr: SocketAddr,
+    shutdown: CancellationToken,
+) {
+    let mut retry = INITIAL_RETRY;
+
+    info!(
+        target_addr = %public_addr,
+        "hairpin keepalive started"
+    );
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("hairpin keepalive stopped");
+                break;
+            }
+            _ = sleep(retry) => {}
+        }
+
+        match TcpStream::connect(public_addr).await {
+            Ok(mut stream) => {
+                if let Err(e) = stream.write_all(KEEPALIVE_BYTE).await {
+                    debug!(error = %e, "keepalive write failed");
+                }
+                drop(stream);
+                retry = HEARTBEAT_INTERVAL;
+                debug!("hairpin keepalive succeeded");
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    retry_ms = retry.as_millis(),
+                    "hairpin keepalive failed"
+                );
+                retry = (retry * 3 / 2).min(MAX_RETRY);
+            }
+        }
+    }
+}

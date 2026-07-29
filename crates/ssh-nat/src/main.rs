@@ -18,10 +18,10 @@ enum Cli {
         #[arg(last = true)]
         ssh_args: Vec<String>,
     },
-    /// Gate proxy subcommand (used as ssh ProxyCommand)
+    /// Gate proxy subcommand (used as ssh ProxyCommand).
+    /// Discover endpoint from registry automatically.
     GateProxy {
-        ip: String,
-        port: u16,
+        host: String,
     },
 }
 
@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli {
         Cli::Ssh { user_at_host, ssh_args } => cmd_ssh(&user_at_host, &ssh_args),
-        Cli::GateProxy { ip, port } => proxy::run(&ip, port),
+        Cli::GateProxy { host } => proxy::run(&host),
     }
 }
 
@@ -82,7 +82,7 @@ fn cmd_ssh(user_at_host: &str, ssh_args: &[String]) -> anyhow::Result<()> {
 
     let tmp = temp_known_hosts(hostname, host_pubkey)?;
 
-    let proxy_cmd = format!("ssh-nat gate-proxy {} {}", ip, port);
+    let proxy_cmd = format!("ssh-nat gate-proxy {}", hostname);
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o")
         .arg(format!("ProxyCommand={}", proxy_cmd))

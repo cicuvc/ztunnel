@@ -41,7 +41,7 @@ async fn main() {
         .unwrap_or_else(|_| "stunserver2025.stunprotocol.org:3478".into());
     let stun_server: SocketAddr = resolve_v4(&stun_server_str);
     let registry_url = std::env::var("REGISTRY_URL")
-        .unwrap_or_else(|_| "https://tapi3.cicuvc.top".into());
+        .unwrap_or_else(|_| "https://tapi.cicuvc.top".into());
 
     let config = PunchConfig {
         local_port,

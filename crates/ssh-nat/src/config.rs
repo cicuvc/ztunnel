@@ -18,14 +18,16 @@ impl Config {
     }
 
     pub fn registry_url(&self) -> String {
-        if let Ok(url) = std::env::var("ZT_REGISTRY") {
-            if !url.is_empty() {
-                return url;
+        for var in ["REGISTRY_URL", "ZT_REGISTRY"] {
+            if let Ok(url) = std::env::var(var) {
+                if !url.is_empty() {
+                    return url;
+                }
             }
         }
         self.registry_url
             .clone()
-            .unwrap_or_else(|| "https://tapi3.cicuvc.top".to_string())
+            .unwrap_or_else(|| "https://tapi.cicuvc.top".to_string())
     }
 
     pub fn secret_path() -> PathBuf {

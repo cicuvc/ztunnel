@@ -2,6 +2,7 @@ mod config;
 mod proxy;
 
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use clap::Parser;
 use zt_common::token::{self, TokenPurpose};
@@ -136,8 +137,12 @@ fn sync_time(registry_url: &str) -> i64 {
 }
 
 fn temp_known_hosts(hostname: &str, pubkey: &str) -> anyhow::Result<PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("ssh_nat_known_hosts_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join("ssh_nat_known_hosts");
+    // Always overwrite with fresh content; file is not cleaned up eagerly since
+    // ssh reads it after this function returns (we exec ssh).  The OS /tmp
+    // cleaner or the next invocation handles cleanup.
     let mut f = std::fs::File::create(&tmp)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     writeln!(f, "{} {}", hostname, pubkey)?;
     Ok(tmp)
 }

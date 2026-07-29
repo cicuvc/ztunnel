@@ -14,7 +14,7 @@ pub fn run(ip: &str, port: u16) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid address: {}", e))?;
 
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Only write timeout; reads can block indefinitely (idle SSH connections).
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
     let window = token::current_window();
@@ -66,7 +66,6 @@ pub fn run(ip: &str, port: u16) -> anyhow::Result<()> {
         let _ = tx_write.send(Ok(()));
     });
 
-    // Wait for either thread to finish (connection closed or error)
     let _ = rx.recv();
     Ok(())
 }

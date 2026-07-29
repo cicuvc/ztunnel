@@ -36,6 +36,10 @@ impl RegistryClient {
         }
     }
 
+    pub fn time_offset(&self) -> i64 {
+        self.time_offset
+    }
+
     pub async fn sync_time(&mut self) {
         let url = format!("{}/api?cmd=time", self.base_url);
         match self.client.get(&url).send().await {

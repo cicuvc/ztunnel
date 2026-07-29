@@ -55,14 +55,15 @@ async fn main() {
     let public_addr: SocketAddr = SocketAddr::new(mapping.ip.into(), mapping.port);
     info!(%public_addr, "gate listening");
 
-    let gate = Arc::new(Gate::new(target, &secret));
+    let mut registry = RegistryClient::new(&registry_url, &secret);
+    registry.sync_time().await;
+    let time_offset = registry.time_offset();
+
+    let gate = Arc::new(Gate::new(target, &secret, time_offset));
     let shutdown = CancellationToken::new();
 
     let ka_shutdown = shutdown.child_token();
     tokio::spawn(keepalive::spawn_hairpin_keepalive(public_addr, ka_shutdown));
-
-    let mut registry = RegistryClient::new(&registry_url, &secret);
-    registry.sync_time().await;
     let record = EndpointRecord {
         ip: mapping.ip.to_string(),
         port: mapping.port,

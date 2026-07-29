@@ -17,6 +17,7 @@ pub struct Gate {
     target: SocketAddr,
     secret: Vec<u8>,
     bans: Arc<Mutex<HashMap<IpAddr, BanEntry>>>,
+    time_offset: i64,
 }
 
 struct BanEntry {
@@ -25,11 +26,12 @@ struct BanEntry {
 }
 
 impl Gate {
-    pub fn new(target: SocketAddr, secret: &[u8]) -> Self {
+    pub fn new(target: SocketAddr, secret: &[u8], time_offset: i64) -> Self {
         Self {
             target,
             secret: secret.to_vec(),
             bans: Arc::new(Mutex::new(HashMap::new())),
+            time_offset,
         }
     }
 
@@ -48,13 +50,15 @@ impl Gate {
         let result = self.gate_connection(stream).await;
 
         if let Some(ip) = ip {
-            if result.is_err() {
-                self.record_failure(ip).await;
+            match result {
+                Err(()) => self.record_failure(ip).await,
+                Ok(true) => self.clear_failures(ip).await, // successful auth — reset ban count
+                Ok(false) => {} // keepalive — no action
             }
         }
     }
 
-    async fn gate_connection(self: &Arc<Self>, mut stream: TcpStream) -> Result<(), ()> {
+    async fn gate_connection(self: &Arc<Self>, mut stream: TcpStream) -> Result<bool, ()> {
         let mut line = String::new();
         {
             let mut reader = BufReader::new(&mut stream);
@@ -69,6 +73,12 @@ impl Gate {
         }
 
         let line = line.trim();
+
+        if line == "ZTKEEPALIVE1" {
+            debug!("keepalive probe, closing silently");
+            return Ok(false);
+        }
+
         if !self.verify_line(line) {
             debug!("gate token rejected");
             return Err(());
@@ -92,7 +102,7 @@ impl Gate {
         }
 
         info!(target = %self.target, remote = ?peer, "gate: connection closed");
-        Ok(())
+        Ok(true)
     }
 
     fn verify_line(&self, line: &str) -> bool {
@@ -107,6 +117,9 @@ impl Gate {
         };
 
         let token = parts[2];
+        // Gate token window is provided by the client, not dependent on local clock.
+        // The time_offset is logged for diagnostics but not used in verification,
+        // since the client sends the window it used to generate the token.
         token::verify(&self.secret, TokenPurpose::Gate, token, window)
     }
 
@@ -129,5 +142,10 @@ impl Gate {
         if entry.count >= BAN_THRESHOLD {
             warn!(%ip, count = entry.count, "ip banned for 1h");
         }
+    }
+
+    async fn clear_failures(&self, ip: IpAddr) {
+        let mut bans = self.bans.lock().await;
+        bans.remove(&ip);
     }
 }

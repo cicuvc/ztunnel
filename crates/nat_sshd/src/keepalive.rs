@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const INITIAL_RETRY: Duration = Duration::from_millis(300);
 const MAX_RETRY: Duration = Duration::from_secs(5);
-const KEEPALIVE_BYTE: &[u8] = b"\x00";
 
 pub async fn spawn_hairpin_keepalive(
     public_addr: SocketAddr,
@@ -33,7 +32,8 @@ pub async fn spawn_hairpin_keepalive(
 
         match TcpStream::connect(public_addr).await {
             Ok(mut stream) => {
-                if let Err(e) = stream.write_all(KEEPALIVE_BYTE).await {
+                // Gate recognizes this line and closes silently without counting as failure.
+                if let Err(e) = stream.write_all(b"ZTKEEPALIVE1\n").await {
                     debug!(error = %e, "keepalive write failed");
                 }
                 drop(stream);

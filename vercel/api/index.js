@@ -1,9 +1,8 @@
 import { verify, currentWindow } from '../lib/auth.js';
 
 const STALE_SECS = 90;
+const EC_API = 'https://api.vercel.com/v1/edge-config';
 
-// In-memory store: shared within the same function instance.
-// Updated every 20s by heartbeat; cold-start gaps are brief and self-healing.
 let _endpoint = null;
 
 function timeAgo(ts) {
@@ -11,6 +10,50 @@ function timeAgo(ts) {
   if (secs < 60) return `${secs}s ago`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
   return `${Math.floor(secs / 3600)}h ago`;
+}
+
+async function edgeGet(key) {
+  const id = process.env.EDGE_CONFIG_ID;
+  const token = process.env.VERCEL_API_TOKEN;
+  if (!id || !token) return null;
+  try {
+    const resp = await fetch(`${EC_API}/${id}/items?key=${key}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    // Edge Config returns { items: [{ value: ... }] }
+    if (body.items && body.items.length > 0) {
+      return body.items[0].value;
+    }
+    return null;
+  } catch { return null; }
+}
+
+async function edgeSet(key, value) {
+  const id = process.env.EDGE_CONFIG_ID;
+  const token = process.env.VERCEL_API_TOKEN;
+  if (!id || !token) return;
+  try {
+    await fetch(`${EC_API}/${id}/items`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [{ operation: 'upsert', key, value }],
+      }),
+    });
+  } catch { /* best-effort */ }
+}
+
+async function getEndpoint() {
+  if (_endpoint) return _endpoint;
+  // Cold start: try to recover from Edge Config
+  const stored = await edgeGet('zt:endpoint');
+  if (stored) _endpoint = stored;
+  return _endpoint;
 }
 
 function missing(secret) {
@@ -26,26 +69,22 @@ export default async function handler(req, res) {
     return;
   }
 
-  // POST /api → register
   if (req.method === 'POST') {
     return handleRegister(req, res, secret);
   }
 
-  // GET /api?w=&t= → endpoint lookup
   if (req.method === 'GET' && req.query?.w && req.query?.t) {
     return handleEndpoint(req, res, secret);
   }
 
-  // GET /api?cmd=time → server timestamp (for clock sync)
   if (req.query?.cmd === 'time') {
     return res.status(200).json({ ts: Math.floor(Date.now() / 1000) });
   }
 
-  // GET /api (no params) → status page
   return handleStatus(req, res);
 }
 
-function handleRegister(req, res, secret) {
+async function handleRegister(req, res, secret) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -61,11 +100,13 @@ function handleRegister(req, res, secret) {
   }
 
   _endpoint = { ip, port, ts, host_pubkey, status, nat_type_suspect: !!nat_type_suspect };
+  // Persist to Edge Config (best-effort)
+  edgeSet('zt:endpoint', _endpoint);
 
   return res.status(200).json({ ok: true });
 }
 
-function handleEndpoint(req, res, secret) {
+async function handleEndpoint(req, res, secret) {
   const { w, t } = req.query;
   const window = parseInt(w, 10);
   if (isNaN(window)) {
@@ -76,20 +117,18 @@ function handleEndpoint(req, res, secret) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  if (!_endpoint) {
+  const record = await getEndpoint();
+  if (!record) {
     return res.status(404).json({ error: 'no endpoint registered' });
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const stale = (now - _endpoint.ts) > STALE_SECS;
+  const stale = (now - record.ts) > STALE_SECS;
 
-  return res.status(200).json({ ..._endpoint, stale });
+  return res.status(200).json({ ...record, stale });
 }
 
 function handleStatus(req, res) {
-  const now = Math.floor(Date.now() / 1000);
-  const stale = _endpoint ? (now - _endpoint.ts) > STALE_SECS : true;
-
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>ztunnel status</title>
@@ -97,24 +136,13 @@ function handleStatus(req, res) {
 <style>
   body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2em auto; padding: 0 1em; }
   h1 { color: #333; }
-  .status { display: inline-block; padding: 0.25em 0.75em; border-radius: 4px; font-weight: bold; }
-  .active { background: #d4edda; color: #155724; }
-  .down { background: #f8d7da; color: #721c24; }
-  .stale { background: #fff3cd; color: #856404; }
   .meta { color: #666; font-size: 0.9em; }
+  .stale { background: #fff3cd; color: #856404; padding: 0.25em 0.75em; border-radius: 4px; }
 </style>
 </head>
 <body>
 <h1>ztunnel registry</h1>
-${_endpoint ? `
-<p>Status: <span class="status ${_endpoint.status}">${_endpoint.status}</span>
-${stale ? ' <span class="status stale">stale</span>' : ''}</p>
-<p>Endpoint: <code>${_endpoint.ip}:${_endpoint.port}</code></p>
-<p class="meta">Last heartbeat: ${timeAgo(_endpoint.ts)}</p>
-<p class="meta">nat_type_suspect: ${_endpoint.nat_type_suspect ? 'yes' : 'no'}</p>
-` : `
-<p>No endpoint registered yet.</p>
-`}
+<p class="meta">Endpoint info requires authentication.</p>
 </body></html>`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');

@@ -86,10 +86,11 @@ async fn main() {
     info!("accepting connections...");
 
     let mut failures: u32 = 0;
+    let mut punch_retry: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
-            conn = listener.as_mut().unwrap().accept() => {
+            conn = async { listener.as_mut().unwrap().accept().await }, if listener.is_some() => {
                 match conn {
                     Ok((stream, addr)) => {
                         info!(remote = %addr.ip(), "incoming connection");
@@ -104,59 +105,33 @@ async fn main() {
                     keepalive::Signal::Failed => {
                         failures += 1;
                         let threshold = if in_reinforce_window() { REINFORCE_THRESHOLD } else { SUSPECT_THRESHOLD };
-                        if failures >= threshold {
+                        if failures >= threshold && listener.is_some() {
                             warn!(failures, "re-punching (suspect state)");
 
-                            // Close old listener so the new STUN socket can bind
+                            // Close old listener so the new STUN socket can bind,
+                            // then let the retry arm do the punch (with backoff).
                             drop(listener.take());
-
-                            match punch::punch_and_listen(&config).await {
-                                Ok((new_l, new_m)) => {
-                                    if new_m.port != mapping.port || new_m.ip != mapping.ip {
-                                        info!(old = %public_addr, new = %SocketAddr::new(new_m.ip.into(), new_m.port), "NAT mapping changed");
-                                    }
-                                    mapping = new_m;
-                                    public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
-                                    listener = Some(new_l);
-
-                                    // Update shared record & re-register
-                                    let mut rec = EndpointRecord {
-                                        ip: mapping.ip.to_string(),
-                                        port: mapping.port,
-                                        ts: unix_now(),
-                                        host_pubkey: load_host_pubkey(),
-                                        status: EndpointStatus::Active,
-                                        nat_type_suspect: false,
-                                    };
-                                    let _ = registry.register(&rec).await;
-                                    rec.ts = unix_now();
-                                    let _ = record_tx.send(rec);
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "re-punch failed");
-                                    // The old listener was dropped; re-create one on the same port
-                                    match punch::punch_and_listen(&config).await {
-                                        Ok((l, m)) => {
-                                            mapping = m;
-                                            public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
-                                            listener = Some(l);
-                                        }
-                                        Err(e2) => {
-                                            warn!(error = %e2, "recovery punch also failed");
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Restart keepalive
-                            ka_shutdown.cancel();
-                            ka_shutdown = shutdown.child_token();
-                            tokio::spawn(keepalive::run(public_addr, ka_tx.clone(), ka_shutdown.child_token()));
-
+                            punch_retry = Some(tokio::time::Instant::now());
                             failures = 0;
                         }
                     }
                     keepalive::Signal::Succeeded => { failures = 0; }
+                }
+            }
+            _ = async { tokio::time::sleep_until(punch_retry.unwrap()).await }, if punch_retry.is_some() => {
+                match punch::punch_and_listen(&config).await {
+                    Ok((new_l, new_m)) => {
+                        on_punch_success(
+                            new_l, new_m, &mut listener, &mut mapping, &mut public_addr,
+                            &registry, &record_tx, &shutdown, &mut ka_shutdown, &ka_tx,
+                        ).await;
+                        punch_retry = None;
+                        failures = 0;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "punch failed, retrying in 5s");
+                        punch_retry = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                    }
                 }
             }
             _ = signal::ctrl_c() => {
@@ -166,6 +141,53 @@ async fn main() {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn on_punch_success(
+    new_listener: tokio::net::TcpListener,
+    new_mapping: zt_common::stun::XorMappedAddress,
+    listener: &mut Option<tokio::net::TcpListener>,
+    mapping: &mut zt_common::stun::XorMappedAddress,
+    public_addr: &mut SocketAddr,
+    registry: &RegistryClient,
+    record_tx: &watch::Sender<EndpointRecord>,
+    shutdown: &CancellationToken,
+    ka_shutdown: &mut CancellationToken,
+    ka_tx: &mpsc::Sender<keepalive::Signal>,
+) {
+    if new_mapping.port != mapping.port || new_mapping.ip != mapping.ip {
+        info!(
+            old = %public_addr,
+            new = %SocketAddr::new(new_mapping.ip.into(), new_mapping.port),
+            "NAT mapping changed"
+        );
+    }
+    *mapping = new_mapping;
+    *public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
+    *listener = Some(new_listener);
+
+    // Update shared record & re-register immediately
+    let mut rec = EndpointRecord {
+        ip: mapping.ip.to_string(),
+        port: mapping.port,
+        ts: unix_now(),
+        host_pubkey: load_host_pubkey(),
+        status: EndpointStatus::Active,
+        nat_type_suspect: false,
+    };
+    if let Err(e) = registry.register(&rec).await {
+        warn!(error = %e, "re-registration failed");
+    }
+    rec.ts = unix_now();
+    let _ = record_tx.send(rec);
+
+    // Restart keepalive with the (possibly new) address
+    ka_shutdown.cancel();
+    *ka_shutdown = shutdown.child_token();
+    tokio::spawn(keepalive::run(*public_addr, ka_tx.clone(), ka_shutdown.child_token()));
+
+    info!("re-punch complete, back to ACTIVE");
 }
 
 fn in_reinforce_window() -> bool {

@@ -1,15 +1,17 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use zt_common::token::{self, TokenPurpose};
 
 use crate::gate::BanList;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const TLS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEADER_BYTES: usize = 16384;
 const GATE_HEADER: &[u8] = b"x-zt-gate:";
 
@@ -26,15 +28,17 @@ pub struct HttpGate {
     secret: Vec<u8>,
     bans: BanList,
     time_offset: i64,
+    tls: TlsAcceptor,
 }
 
 impl HttpGate {
-    pub fn new(target: SocketAddr, secret: &[u8], time_offset: i64) -> Self {
+    pub fn new(target: SocketAddr, secret: &[u8], time_offset: i64, tls: TlsAcceptor) -> Self {
         Self {
             target,
             secret: secret.to_vec(),
             bans: BanList::new(),
             time_offset,
+            tls,
         }
     }
 
@@ -50,7 +54,23 @@ impl HttpGate {
             }
         }
 
-        let result = self.gate_connection(stream).await;
+        // TLS first.  Anything that is not a TLS ClientHello (scanners,
+        // our own cleartext ZTKEEPALIVE1 probes) dies here, silently,
+        // without touching the ban list.
+        let tls_result = timeout(TLS_TIMEOUT, self.tls.accept(stream)).await;
+        let mut tls_stream = match tls_result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                debug!(error = %e, "TLS handshake failed, dropping");
+                return;
+            }
+            Err(_) => {
+                debug!("TLS handshake timeout, dropping");
+                return;
+            }
+        };
+
+        let result = self.gate_connection(&mut tls_stream).await;
 
         if let Some(ip) = ip {
             match result {
@@ -61,8 +81,11 @@ impl HttpGate {
         }
     }
 
-    async fn gate_connection(self: &Arc<Self>, mut stream: TcpStream) -> Result<bool, ()> {
-        let buf = match read_headers(&mut stream).await {
+    async fn gate_connection<S>(&self, stream: &mut S) -> Result<bool, ()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let buf = match read_headers(stream).await {
             Some(b) => b,
             None => return Err(()),
         };
@@ -91,8 +114,7 @@ impl HttpGate {
         }
 
         debug!("gate token accepted");
-        let peer = stream.peer_addr().ok();
-        info!(target = %self.target, remote = ?peer, "http gate: bridging to target");
+        info!(target = %self.target, "http gate: bridging to target");
 
         // Strip the gate header line, forward the rest verbatim.
         let mut forwarded = Vec::with_capacity(buf.len());
@@ -105,7 +127,7 @@ impl HttpGate {
                     warn!(error = %e, "http gate: failed to forward request head");
                     return Err(());
                 }
-                tokio::io::copy_bidirectional(&mut stream, &mut server)
+                tokio::io::copy_bidirectional(stream, &mut server)
                     .await
                     .ok();
             }
@@ -115,12 +137,43 @@ impl HttpGate {
             }
         }
 
-        info!(target = %self.target, remote = ?peer, "http gate: connection closed");
+        info!(target = %self.target, "http gate: connection closed");
         Ok(true)
     }
 }
 
-async fn read_headers(stream: &mut TcpStream) -> Option<Vec<u8>> {
+/// Build a TLS acceptor from PEM cert chain / key files, ALPN http/1.1 only
+/// (h2's connection preface would break HTTP header inspection).
+pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {}", cert_path, e))?;
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {}", key_path, e))?;
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse cert PEM: {}", e))?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path);
+    }
+
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .map_err(|e| anyhow::anyhow!("failed to parse key PEM: {}", e))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path))?;
+
+    let mut config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("invalid cert/key pair: {}", e))?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn read_headers<S>(stream: &mut S) -> Option<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
 

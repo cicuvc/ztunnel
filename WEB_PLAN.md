@@ -10,7 +10,11 @@
   （`/?bootstrap=1` 为引导逃生口；token 20s 主动刷新；502 时丢弃缓存配置）
 - `crates/nat_sshd/src/gate.rs`：ban 逻辑抽为共享 `BanList`
 - `crates/nat_sshd/src/gate_http.rs`：header gate（缓冲至 `\r\n\r\n`
-  ≤16KB/3s，OPTIONS 直接应答，X-ZT-Gate 验证后剥头透传）+ 5 单测
+  ≤16KB/3s，OPTIONS 直接应答，X-ZT-Gate 验证后剥头透传）+ 5 单测。
+  **daemon 终结 TLS**（rustls，ALPN 限 http/1.1）：gate 头在 TLS 加密
+  流内，TCP 层无法窥视，因此本地 app 改为 plain HTTP（TARGET）。
+  非 TLS 探测（含 keepalive 的 ZTKEEPALIVE1）在握手阶段静默丢弃，
+  不计 ban——TLS 服务对扫描器完全隐身。
 - `crates/nat_sshd/src/ddns.rs`：CF A 记录更新（env：WEB_DOMAIN /
   CF_ZONE_ID / CF_RECORD_ID / CF_TOKEN(_FILE)）
 - `crates/nat_sshd/src/main.rs`：SERVICE / GATE_MODE env 参数化，
@@ -21,11 +25,14 @@
 ## 部署待办（用户侧）
 
 1. Vercel 项目 env 加 `WEB_DOMAIN=test.cicuvc.top`，重新部署
-2. 本地 8443 起 HTTPS 服务器：certbot 证书 + `Access-Control-Allow-Origin: *`
-   响应头 + ALPN 限 `http/1.1`
-3. CF 控制台拿 zone/record ID 填入 `deploy/ztunnel.nat-webd.service`，
+2. 本地起 plain HTTP app（默认 TARGET=127.0.0.1:8080），无需 TLS/CORS
+   （CORS 预检由 daemon 应答，但 app 响应仍需 `Access-Control-Allow-Origin: *`）
+3. 确认 certbot 证书路径（默认 /etc/letsencrypt/live/$WEB_DOMAIN/），
+   daemon 进程需有读权限（certbot privkey 默认 0600 root —— 用
+   `setfacl` 或 deploy hook 复制授权）
+4. CF 控制台拿 zone/record ID 填入 `deploy/ztunnel.nat-webd.service`，
    cf token 放 `~/.config/ztunnel/cf_token`（`Key: <token>` 格式）
-4. `systemctl --user enable --now ztunnel.nat-webd`
+5. `systemctl --user enable --now ztunnel.nat-webd`
 
 ## 已知限制
 
@@ -52,7 +59,9 @@ research 参考：`cf_worker_sw.js`（CF Worker 版落地页）、`nat_backend.p
 - gate token 由 registry 公开签发（`/api/web-config`），仅作扫描器隐身，
   非访问控制；真正认证由 web 应用自己负责
 - 多服务 = nat_sshd 第二实例 + 参数化（SERVICE / GATE_MODE 环境变量）
-- TLS 由本地 web 服务器终结，daemon 纯 TCP 透传
+- ~~TLS 由本地 web 服务器终结~~ **修正（2026-07-30 实测后）**：daemon
+  终结 TLS——gate 头在 TLS 加密流内，TCP 层不可见；本地 app 只需
+  plain HTTP。certbot 证书路径用 TLS_CERT/TLS_KEY 配置
 
 ## 技术约束（必须遵守）
 

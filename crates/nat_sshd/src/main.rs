@@ -87,7 +87,10 @@ async fn main() {
     let time_offset = registry.time_offset();
 
     let gate = Arc::new(match gate_mode_str.as_str() {
-        "header" => GateMode::Header(Arc::new(HttpGate::new(target, &secret, time_offset))),
+        "header" => {
+            let acceptor = load_tls(&ddns).expect("TLS setup failed");
+            GateMode::Header(Arc::new(HttpGate::new(target, &secret, time_offset, acceptor)))
+        }
         _ => GateMode::Line(Arc::new(Gate::new(target, &secret, time_offset))),
     });
     let shutdown = CancellationToken::new();
@@ -254,6 +257,18 @@ fn resolve_v4(addr: &str) -> SocketAddr {
         .expect("failed to resolve address")
         .find(|a| a.is_ipv4())
         .expect("no IPv4 address found")
+}
+
+fn load_tls(ddns: &Option<DdnsConfig>) -> Result<tokio_rustls::TlsAcceptor, String> {
+    let domain = ddns.as_ref().map(|d| d.domain.as_str()).unwrap_or("");
+    let cert = std::env::var("TLS_CERT").unwrap_or_else(|_| {
+        format!("/etc/letsencrypt/live/{}/fullchain.pem", domain)
+    });
+    let key = std::env::var("TLS_KEY").unwrap_or_else(|_| {
+        format!("/etc/letsencrypt/live/{}/privkey.pem", domain)
+    });
+    gate_http::build_tls_acceptor(&cert, &key)
+        .map_err(|e| format!("header gate mode requires TLS certs: {} (set TLS_CERT/TLS_KEY)", e))
 }
 
 fn load_host_pubkey(service: &str) -> String {

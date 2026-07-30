@@ -7,6 +7,10 @@ pub enum EndpointStatus {
     Down,
 }
 
+fn default_service() -> String {
+    "ssh".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EndpointRecord {
     pub ip: String,
@@ -16,6 +20,8 @@ pub struct EndpointRecord {
     pub status: EndpointStatus,
     #[serde(default)]
     pub nat_type_suspect: bool,
+    #[serde(default = "default_service")]
+    pub service: String,
 }
 
 #[cfg(test)]
@@ -31,6 +37,7 @@ mod tests {
             host_pubkey: "ssh-ed25519 AAAA...".into(),
             status: EndpointStatus::Active,
             nat_type_suspect: false,
+            service: "ssh".into(),
         };
 
         let json = serde_json::to_string(&record).unwrap();
@@ -47,6 +54,7 @@ mod tests {
             host_pubkey: "".into(),
             status: EndpointStatus::Down,
             nat_type_suspect: true,
+            service: "ssh".into(),
         };
 
         let json = serde_json::to_string(&record).unwrap();
@@ -60,5 +68,6 @@ mod tests {
         let json = r#"{"ip":"10.0.0.1","port":2222,"ts":1000,"host_pubkey":"","status":"active"}"#;
         let record: EndpointRecord = serde_json::from_str(json).unwrap();
         assert!(!record.nat_type_suspect);
+        assert_eq!(record.service, "ssh");
     }
 }

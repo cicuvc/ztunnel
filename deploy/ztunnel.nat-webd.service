@@ -1,0 +1,27 @@
+[Unit]
+Description=ztunnel NAT traversal Web daemon (HTTPS via header gate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Same binary as nat-sshd, parameterized by environment:
+ExecStart=%h/.local/bin/nat-sshd
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=nat_sshd=info
+Environment=STUN_SERVER=stunserver2025.stunprotocol.org:3478
+Environment=REGISTRY_URL=https://tapi.cicuvc.top
+Environment=SERVICE=web
+Environment=GATE_MODE=header
+Environment=LOCAL_PORT=8443
+Environment=TARGET=127.0.0.1:8443
+# DNS A-record updates (Cloudflare).  Token read from CF_TOKEN,
+# CF_TOKEN_FILE, or %h/.config/ztunnel/cf_token ("Key: <token>" format).
+Environment=WEB_DOMAIN=test.cicuvc.top
+Environment=CF_ZONE_ID=your-zone-id
+Environment=CF_RECORD_ID=your-record-id
+# Environment=CF_TOKEN_FILE=%h/.config/ztunnel/cf_token
+
+[Install]
+WantedBy=default.target

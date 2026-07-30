@@ -13,11 +13,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const BAN_THRESHOLD: u32 = 5;
 const BAN_DURATION: Duration = Duration::from_secs(3600);
 
-pub struct Gate {
-    target: SocketAddr,
-    secret: Vec<u8>,
-    bans: Arc<Mutex<HashMap<IpAddr, BanEntry>>>,
-    time_offset: i64,
+pub struct BanList {
+    map: Mutex<HashMap<IpAddr, BanEntry>>,
 }
 
 struct BanEntry {
@@ -25,12 +22,53 @@ struct BanEntry {
     last_failure: Instant,
 }
 
+impl BanList {
+    pub fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn is_banned(&self, ip: IpAddr) -> bool {
+        let bans = self.map.lock().await;
+        bans.get(&ip)
+            .map(|e| e.count >= BAN_THRESHOLD && e.last_failure.elapsed() < BAN_DURATION)
+            .unwrap_or(false)
+    }
+
+    pub async fn record_failure(&self, ip: IpAddr) {
+        let mut bans = self.map.lock().await;
+        let entry = bans.entry(ip).or_insert(BanEntry {
+            count: 0,
+            last_failure: Instant::now(),
+        });
+        entry.count += 1;
+        entry.last_failure = Instant::now();
+
+        if entry.count >= BAN_THRESHOLD {
+            warn!(%ip, count = entry.count, "ip banned for 1h");
+        }
+    }
+
+    pub async fn clear_failures(&self, ip: IpAddr) {
+        let mut bans = self.map.lock().await;
+        bans.remove(&ip);
+    }
+}
+
+pub struct Gate {
+    target: SocketAddr,
+    secret: Vec<u8>,
+    bans: BanList,
+    time_offset: i64,
+}
+
 impl Gate {
     pub fn new(target: SocketAddr, secret: &[u8], time_offset: i64) -> Self {
         Self {
             target,
             secret: secret.to_vec(),
-            bans: Arc::new(Mutex::new(HashMap::new())),
+            bans: BanList::new(),
             time_offset,
         }
     }
@@ -40,7 +78,7 @@ impl Gate {
         let ip = peer.map(|p| p.ip());
 
         if let Some(ip) = ip {
-            if self.is_banned(ip).await {
+            if self.bans.is_banned(ip).await {
                 debug!(%ip, "banned ip, dropping silently");
                 drop(stream);
                 return;
@@ -51,8 +89,8 @@ impl Gate {
 
         if let Some(ip) = ip {
             match result {
-                Err(()) => self.record_failure(ip).await,
-                Ok(true) => self.clear_failures(ip).await,
+                Err(()) => self.bans.record_failure(ip).await,
+                Ok(true) => self.bans.clear_failures(ip).await,
                 Ok(false) => {}
             }
         }
@@ -127,31 +165,5 @@ impl Gate {
         let token = parts[2];
         let server_window = token::adjusted_window(self.time_offset);
         token::verify_synced(&self.secret, TokenPurpose::Gate, token, client_window, server_window)
-    }
-
-    async fn is_banned(&self, ip: IpAddr) -> bool {
-        let bans = self.bans.lock().await;
-        bans.get(&ip)
-            .map(|e| e.count >= BAN_THRESHOLD && e.last_failure.elapsed() < BAN_DURATION)
-            .unwrap_or(false)
-    }
-
-    async fn record_failure(&self, ip: IpAddr) {
-        let mut bans = self.bans.lock().await;
-        let entry = bans.entry(ip).or_insert(BanEntry {
-            count: 0,
-            last_failure: Instant::now(),
-        });
-        entry.count += 1;
-        entry.last_failure = Instant::now();
-
-        if entry.count >= BAN_THRESHOLD {
-            warn!(%ip, count = entry.count, "ip banned for 1h");
-        }
-    }
-
-    async fn clear_failures(&self, ip: IpAddr) {
-        let mut bans = self.bans.lock().await;
-        bans.remove(&ip);
     }
 }

@@ -1,4 +1,6 @@
+mod ddns;
 mod gate;
+mod gate_http;
 mod keepalive;
 pub mod punch;
 mod register;
@@ -13,13 +15,29 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zt_common::types::{EndpointRecord, EndpointStatus};
 
+use crate::ddns::DdnsConfig;
 use crate::gate::Gate;
+use crate::gate_http::HttpGate;
 use crate::punch::PunchConfig;
 use crate::register::RegistryClient;
 
 const SUSPECT_THRESHOLD: u32 = 3;
 const REINFORCE_THRESHOLD: u32 = 1;
 const REGISTER_INTERVAL: Duration = Duration::from_secs(20);
+
+enum GateMode {
+    Line(Arc<Gate>),
+    Header(Arc<HttpGate>),
+}
+
+impl GateMode {
+    async fn handle(&self, stream: tokio::net::TcpStream) {
+        match self {
+            GateMode::Line(g) => g.handle(stream).await,
+            GateMode::Header(g) => g.handle(stream).await,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -46,6 +64,9 @@ async fn main() {
     let stun_server: SocketAddr = resolve_v4(&stun_server_str);
     let registry_url = std::env::var("REGISTRY_URL")
         .unwrap_or_else(|_| "https://tapi.cicuvc.top".into());
+    let service = std::env::var("SERVICE").unwrap_or_else(|_| "ssh".into());
+    let gate_mode_str = std::env::var("GATE_MODE").unwrap_or_else(|_| "line".into());
+    let ddns = DdnsConfig::from_env();
 
     let config = PunchConfig { local_port, stun_addr: stun_server };
 
@@ -55,13 +76,20 @@ async fn main() {
     let mut listener = Some(listener);
     let mut mapping = mapping;
     let mut public_addr: SocketAddr = SocketAddr::new(mapping.ip.into(), mapping.port);
-    info!(%public_addr, "gate listening");
+    info!(%public_addr, %service, "gate listening");
+
+    if let Some(cfg) = &ddns {
+        ddns::update_a_record(cfg, mapping.ip).await;
+    }
 
     let mut registry = RegistryClient::new(&registry_url, &secret);
     registry.sync_time().await;
     let time_offset = registry.time_offset();
 
-    let gate = Arc::new(Gate::new(target, &secret, time_offset));
+    let gate = Arc::new(match gate_mode_str.as_str() {
+        "header" => GateMode::Header(Arc::new(HttpGate::new(target, &secret, time_offset))),
+        _ => GateMode::Line(Arc::new(Gate::new(target, &secret, time_offset))),
+    });
     let shutdown = CancellationToken::new();
 
     let (ka_tx, mut ka_rx) = mpsc::channel::<keepalive::Signal>(16);
@@ -73,9 +101,10 @@ async fn main() {
         ip: mapping.ip.to_string(),
         port: mapping.port,
         ts: unix_now(),
-        host_pubkey: load_host_pubkey(),
+        host_pubkey: load_host_pubkey(&service),
         status: EndpointStatus::Active,
         nat_type_suspect: false,
+        service: service.clone(),
     };
 
     let (record_tx, record_rx) = watch::channel(record);
@@ -124,6 +153,7 @@ async fn main() {
                         on_punch_success(
                             new_l, new_m, &mut listener, &mut mapping, &mut public_addr,
                             &registry, &record_tx, &shutdown, &mut ka_shutdown, &ka_tx,
+                            &service, &ddns,
                         ).await;
                         punch_retry = None;
                         failures = 0;
@@ -155,8 +185,11 @@ async fn on_punch_success(
     shutdown: &CancellationToken,
     ka_shutdown: &mut CancellationToken,
     ka_tx: &mpsc::Sender<keepalive::Signal>,
+    service: &str,
+    ddns: &Option<DdnsConfig>,
 ) {
-    if new_mapping.port != mapping.port || new_mapping.ip != mapping.ip {
+    let ip_changed = new_mapping.ip != mapping.ip;
+    if new_mapping.port != mapping.port || ip_changed {
         info!(
             old = %public_addr,
             new = %SocketAddr::new(new_mapping.ip.into(), new_mapping.port),
@@ -167,14 +200,21 @@ async fn on_punch_success(
     *public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
     *listener = Some(new_listener);
 
+    if ip_changed {
+        if let Some(cfg) = ddns {
+            ddns::update_a_record(cfg, mapping.ip).await;
+        }
+    }
+
     // Update shared record & re-register immediately
     let mut rec = EndpointRecord {
         ip: mapping.ip.to_string(),
         port: mapping.port,
         ts: unix_now(),
-        host_pubkey: load_host_pubkey(),
+        host_pubkey: load_host_pubkey(service),
         status: EndpointStatus::Active,
         nat_type_suspect: false,
+        service: service.to_string(),
     };
     if let Err(e) = registry.register(&rec).await {
         warn!(error = %e, "re-registration failed");
@@ -216,7 +256,10 @@ fn resolve_v4(addr: &str) -> SocketAddr {
         .expect("no IPv4 address found")
 }
 
-fn load_host_pubkey() -> String {
+fn load_host_pubkey(service: &str) -> String {
+    if service != "ssh" {
+        return String::new();
+    }
     for path in [
         "/etc/ssh/ssh_host_ed25519_key.pub",
         "/etc/ssh/ssh_host_rsa_key.pub",

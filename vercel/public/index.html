@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ztunnel</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 20px; background: #111; color: #eee; }
+  h1 { color: #0f0; }
+  pre { background: #222; padding: 15px; border-radius: 8px; white-space: pre-wrap; }
+  a { color: #6cf; }
+  #go { display: none; font-size: 1.2em; }
+</style>
+</head>
+<body>
+<h1>ztunnel</h1>
+<pre id="status">Loading...</pre>
+<p id="go"><a href="/">进入站点 &rarr;</a></p>
+<p><small><a href="/?bootstrap=1">重新引导</a></small></p>
+<script>
+function log(m) { document.getElementById('status').textContent += m + '\n'; }
+document.getElementById('status').textContent = '';
+
+fetch('/api?cmd=web-config', { cache: 'no-store' })
+  .then(r => { if (!r.ok) throw new Error('web-config: ' + r.status); return r.json(); })
+  .then(cfg => {
+    log('Backend: ' + cfg.url);
+    if (!('serviceWorker' in navigator)) { log('Service Worker not supported'); return; }
+    return navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(reg => {
+        log('SW registered');
+        const sw = reg.active || reg.installing || reg.waiting;
+        if (sw) sw.postMessage({ type: 'refresh-config' });
+        document.getElementById('go').style.display = 'block';
+      });
+  })
+  .catch(e => log('Error: ' + e));
+</script>
+</body>
+</html>

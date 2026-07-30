@@ -1,15 +1,13 @@
-import { verify, verifySync, currentWindow } from '../lib/auth.js';
+import { verify, verifySync, generate, currentWindow } from '../lib/auth.js';
 
 const STALE_SECS = 90;
 const EC_API = 'https://api.vercel.com/v1/edge-config';
 
-let _endpoint = null;
+// In-memory cache per service; Edge Config is the durable store.
+const _endpoints = {};
 
-function timeAgo(ts) {
-  const secs = Math.floor(Date.now() / 1000) - ts;
-  if (secs < 60) return `${secs}s ago`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  return `${Math.floor(secs / 3600)}h ago`;
+function edgeKey(service) {
+  return `zt:endpoint:${service}`;
 }
 
 async function edgeGet(key) {
@@ -22,7 +20,6 @@ async function edgeGet(key) {
     });
     if (!resp.ok) return null;
     const body = await resp.json();
-    // Edge Config returns { items: [{ value: ... }] }
     if (body.items && body.items.length > 0) {
       return body.items[0].value;
     }
@@ -48,31 +45,40 @@ async function edgeSet(key, value) {
   } catch { /* best-effort */ }
 }
 
-async function getEndpoint() {
-  if (_endpoint) return _endpoint;
-  // Cold start: try to recover from Edge Config
-  const stored = await edgeGet('zt:endpoint');
-  if (stored) _endpoint = stored;
-  return _endpoint;
+async function getEndpoint(service) {
+  if (_endpoints[service]) return _endpoints[service];
+  const stored = await edgeGet(edgeKey(service));
+  if (stored) _endpoints[service] = stored;
+  return _endpoints[service] || null;
 }
 
-function missing(secret) {
-  return !secret ? 500 : 0;
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
 }
 
 export default async function handler(req, res) {
+  cors(res);
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
   const secret = process.env.ZT_SECRET;
   if (!secret) {
-    const code = 500;
-    const body = JSON.stringify({ error: 'server misconfigured' });
-    res.status(code).json(JSON.parse(body));
-    return;
+    return res.status(500).json({ error: 'server misconfigured' });
   }
 
   if (req.method === 'POST') {
     return handleRegister(req, res, secret);
   }
 
+  // GET /api?cmd=web-config → public SW bootstrap (url + gate token)
+  if (req.query?.cmd === 'web-config') {
+    return handleWebConfig(req, res, secret);
+  }
+
+  // GET /api?w=&t=[&service=] → authenticated endpoint lookup
   if (req.method === 'GET' && req.query?.w && req.query?.t) {
     return handleEndpoint(req, res, secret);
   }
@@ -94,30 +100,37 @@ async function handleRegister(req, res, secret) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const { ip, port, ts, host_pubkey, status, nat_type_suspect } = req.body || {};
-  if (!ip || !port || !ts || !host_pubkey || !status) {
+  const { ip, port, ts, host_pubkey, status, nat_type_suspect, service } = req.body || {};
+  if (!ip || !port || !ts || !status) {
     return res.status(400).json({ error: 'missing required fields' });
   }
 
-  _endpoint = { ip, port, ts, host_pubkey, status, nat_type_suspect: !!nat_type_suspect };
-  await edgeSet('zt:endpoint', _endpoint);
+  const svc = service || 'ssh';
+  const record = {
+    ip, port, ts,
+    host_pubkey: host_pubkey || '',
+    status,
+    nat_type_suspect: !!nat_type_suspect,
+    service: svc,
+  };
+  _endpoints[svc] = record;
+  await edgeSet(edgeKey(svc), record);
 
   return res.status(200).json({ ok: true });
 }
 
 async function handleEndpoint(req, res, secret) {
-  const { w, t } = req.query;
-  const clientWindow = parseInt(w, 10);
-  if (isNaN(clientWindow)) {
+  const { w, t, service } = req.query;
+  const window = parseInt(w, 10);
+  if (isNaN(window)) {
     return res.status(400).json({ error: 'invalid window' });
   }
 
-  const serverWindow = currentWindow();
-  if (!verifySync(secret, 'discover', t, clientWindow, serverWindow)) {
+  if (!verifySync(secret, 'discover', t, window, currentWindow())) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const record = await getEndpoint();
+  const record = await getEndpoint(service || 'ssh');
   if (!record) {
     return res.status(404).json({ error: 'no endpoint registered' });
   }
@@ -126,6 +139,37 @@ async function handleEndpoint(req, res, secret) {
   const stale = (now - record.ts) > STALE_SECS;
 
   return res.status(200).json({ ...record, stale });
+}
+
+// Public bootstrap for the service worker.  The gate token is NOT access
+// control (any visitor can fetch it) — it only keeps the punched port
+// invisible to dumb scanners.  Real auth is the web app's job.
+async function handleWebConfig(req, res, secret) {
+  const domain = process.env.WEB_DOMAIN;
+  if (!domain) {
+    return res.status(500).json({ error: 'WEB_DOMAIN not configured' });
+  }
+
+  const record = await getEndpoint('web');
+  if (!record) {
+    return res.status(404).json({ error: 'web service not registered' });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const stale = (now - record.ts) > STALE_SECS;
+  if (stale || record.status !== 'active') {
+    return res.status(503).json({ error: 'web service unavailable', stale });
+  }
+
+  const window = currentWindow();
+  const gate = generate(secret, 'gate', window);
+
+  res.setHeader('Cache-Control', 'no-store');
+  return res.status(200).json({
+    url: `https://${domain}:${record.port}`,
+    window,
+    gate,
+  });
 }
 
 function handleStatus(req, res) {
@@ -137,7 +181,6 @@ function handleStatus(req, res) {
   body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2em auto; padding: 0 1em; }
   h1 { color: #333; }
   .meta { color: #666; font-size: 0.9em; }
-  .stale { background: #fff3cd; color: #856404; padding: 0.25em 0.75em; border-radius: 4px; }
 </style>
 </head>
 <body>

@@ -772,6 +772,7 @@ dependencies = [
  "anyhow",
  "hex",
  "reqwest",
+ "rustls",
  "rustls-pemfile",
  "serde_json",
  "thiserror",

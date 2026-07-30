@@ -9,32 +9,34 @@
   h1 { color: #0f0; }
   pre { background: #222; padding: 15px; border-radius: 8px; white-space: pre-wrap; }
   a { color: #6cf; }
-  #go { display: none; font-size: 1.2em; }
 </style>
 </head>
 <body>
 <h1>ztunnel</h1>
-<pre id="status">Loading...</pre>
-<p id="go"><a href="/">进入站点 &rarr;</a></p>
-<p><small><a href="/?bootstrap=1">重新引导</a></small></p>
+<pre id="s">Initializing...</pre>
+<p><small><a href="/?bootstrap=1" id="bypass">直接访问</a></small></p>
 <script>
-function log(m) { document.getElementById('status').textContent += m + '\n'; }
-document.getElementById('status').textContent = '';
+document.getElementById('s').textContent = '';
 
-fetch('/api?cmd=web-config', { cache: 'no-store' })
-  .then(r => { if (!r.ok) throw new Error('web-config: ' + r.status); return r.json(); })
-  .then(cfg => {
-    log('Backend: ' + cfg.url);
-    if (!('serviceWorker' in navigator)) { log('Service Worker not supported'); return; }
-    return navigator.serviceWorker.register('/sw.js', { scope: '/' })
-      .then(reg => {
-        log('SW registered');
-        const sw = reg.active || reg.installing || reg.waiting;
-        if (sw) sw.postMessage({ type: 'refresh-config' });
-        document.getElementById('go').style.display = 'block';
-      });
-  })
-  .catch(e => log('Error: ' + e));
+if (location.search.includes('bootstrap')) {
+  document.getElementById('s').textContent = 'Bootstrap mode — SW bypassed.';
+} else if (!('serviceWorker' in navigator)) {
+  document.getElementById('s').textContent = 'Service Worker not supported.';
+} else {
+  // Fetch config first so the SW has it immediately on activation.
+  fetch('/api?cmd=web-config', { cache: 'no-store' })
+    .catch(() => null)
+    .then(() => navigator.serviceWorker.register('/sw.js', { scope: '/' }))
+    .then(() => navigator.serviceWorker.ready)
+    .then(reg => {
+      reg.active.postMessage({ type: 'refresh-config' });
+      // Reload — the SW intercepts and returns the backend content.
+      location.reload();
+    })
+    .catch(e => {
+      document.getElementById('s').textContent = 'SW init failed: ' + e.message;
+    });
+}
 </script>
 </body>
 </html>

@@ -4,10 +4,10 @@
 // /api?cmd=web-config) — it hides the port from scanners, nothing more.
 
 const CONFIG_URL = '/api?cmd=web-config';
-const TOKEN_MAX_AGE_MS = 20000; // server token valid ~60s; refresh early
+const TOKEN_MAX_AGE_MS = 20000;
 
-let cfg = null;        // { url, window, gate }
-let cfgFetchedAt = 0;  // ms epoch
+let cfg = null;
+let cfgFetchedAt = 0;
 
 async function refreshConfig() {
   const r = await fetch(CONFIG_URL, { cache: 'no-store' });
@@ -42,7 +42,7 @@ self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (u.origin !== self.location.origin) return;
   if (u.pathname === '/sw.js' || u.pathname.startsWith('/api')) return;
-  if (u.search.includes('bootstrap')) return; // landing page escape hatch
+  if (u.search.includes('bootstrap')) return;
   e.respondWith(proxy(e.request));
 });
 
@@ -51,28 +51,56 @@ async function proxy(req) {
   try {
     c = await getConfig();
   } catch (err) {
-    return bootstrapPage('Backend config unavailable: ' + err.message);
+    return bootstrapPage('Config unavailable: ' + err.message);
   }
 
   const u = new URL(req.url);
+  const backendUrl = c.url + u.pathname + u.search;
   const headers = new Headers(req.headers);
   headers.set('X-ZT-Gate', c.window + ' ' + c.gate);
 
+  // First attempt
   try {
-    return await fetch(c.url + u.pathname + u.search, {
-      method: req.method,
-      headers,
-      body: req.body,
-      duplex: 'half',
-      redirect: 'manual',
-      credentials: 'omit',
-    });
-  } catch (err) {
-    // Backend moved (repunch) or token stale — drop cached config so the
-    // next request re-fetches, and tell the page to retry.
+    return await doFetch(backendUrl, req.method, headers, req.body);
+  } catch (_) {
+    // Backend may have moved (re-punch).  Refresh config and retry once.
     cfg = null;
-    return bootstrapPage('Backend unreachable (may be re-punching). Retry in a few seconds.');
+    try {
+      c = await getConfig();
+    } catch {
+      return bootstrapPage('Backend unreachable. Retry.');
+    }
+    const retryUrl = c.url + u.pathname + u.search;
+    const retryHeaders = new Headers(req.headers);
+    retryHeaders.set('X-ZT-Gate', c.window + ' ' + c.gate);
+    try {
+      return await doFetch(retryUrl, req.method, retryHeaders, req.body);
+    } catch (_) {
+      return bootstrapPage('Backend unreachable after refresh. Retry.');
+    }
   }
+}
+
+async function doFetch(url, method, headers, body) {
+  const resp = await fetch(url, {
+    method,
+    headers,
+    body,
+    duplex: 'half',
+    redirect: 'manual',
+  });
+  // Strip CORS headers — the SW returns within the same origin.
+  const clean = new Headers(resp.headers);
+  for (const h of ['access-control-allow-origin', 'access-control-allow-methods',
+                   'access-control-allow-headers', 'access-control-max-age',
+                   'access-control-allow-credentials']) {
+    clean.delete(h);
+  }
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: clean,
+  });
 }
 
 function bootstrapPage(msg) {

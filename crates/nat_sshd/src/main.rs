@@ -17,6 +17,11 @@ use zt_common::types::{EndpointRecord, EndpointStatus};
 
 use crate::ddns::DdnsConfig;
 use crate::gate::Gate;
+
+// Ensure rustls crypto provider is set (ring) before any TLS operation.
+fn _init_rustls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 use crate::gate_http::HttpGate;
 use crate::punch::PunchConfig;
 use crate::register::RegistryClient;
@@ -48,6 +53,7 @@ async fn main() {
         )
         .init();
 
+    _init_rustls();
     info!("nat-sshd v{}", env!("CARGO_PKG_VERSION"));
 
     let secret = load_secret().expect("failed to load secret");

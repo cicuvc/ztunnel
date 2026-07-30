@@ -15,8 +15,10 @@ const TLS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEADER_BYTES: usize = 16384;
 const GATE_HEADER: &[u8] = b"x-zt-gate:";
 
-const CORS_PREFLIGHT_RESPONSE: &[u8] = b"HTTP/1.1 204 No Content\r\n\
-Access-Control-Allow-Origin: *\r\n\
+const CORS_PREFLIGHT_HEAD: &[u8] = b"HTTP/1.1 204 No Content\r\n\
+Access-Control-Allow-Origin: ";
+const CORS_PREFLIGHT_MID: &[u8] = b"\r\n\
+Access-Control-Allow-Credentials: true\r\n\
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
 Access-Control-Allow-Headers: *\r\n\
 Access-Control-Max-Age: 86400\r\n\
@@ -72,6 +74,10 @@ impl HttpGate {
 
         let result = self.gate_connection(&mut tls_stream).await;
 
+        // Send TLS close_notify before dropping, so clients see a clean
+        // shutdown instead of an abrupt connection reset.
+        let _ = tls_stream.shutdown().await;
+
         if let Some(ip) = ip {
             match result {
                 Err(()) => self.bans.record_failure(ip).await,
@@ -93,9 +99,12 @@ impl HttpGate {
         // CORS preflight never carries custom headers — answer it directly.
         if buf.starts_with(b"OPTIONS ") {
             debug!("CORS preflight, answering directly");
-            if stream.write_all(CORS_PREFLIGHT_RESPONSE).await.is_err() {
-                return Err(());
-            }
+            let origin = extract_origin(&buf).unwrap_or_else(|| "*".to_string());
+            let mut preflight = Vec::with_capacity(256);
+            preflight.extend_from_slice(CORS_PREFLIGHT_HEAD);
+            preflight.extend_from_slice(origin.as_bytes());
+            preflight.extend_from_slice(CORS_PREFLIGHT_MID);
+            let _ = stream.write_all(&preflight).await;
             return Ok(false);
         }
 
@@ -116,6 +125,9 @@ impl HttpGate {
         debug!("gate token accepted");
         info!(target = %self.target, "http gate: bridging to target");
 
+        // Extract Origin header from the request (for credentials mode CORS).
+        let origin = extract_origin(&buf);
+
         // Strip the gate header line, forward the rest verbatim.
         let mut forwarded = Vec::with_capacity(buf.len());
         forwarded.extend_from_slice(&buf[..header_range.0]);
@@ -127,9 +139,10 @@ impl HttpGate {
                     warn!(error = %e, "http gate: failed to forward request head");
                     return Err(());
                 }
-                tokio::io::copy_bidirectional(stream, &mut server)
-                    .await
-                    .ok();
+
+                if let Err(e) = forward_response_with_cors(stream, &mut server, &origin).await {
+                    debug!(error = %e, "http gate: response forward error");
+                }
             }
             Err(e) => {
                 warn!(error = %e, "http gate: failed to connect to target");
@@ -205,6 +218,80 @@ where
 
 /// Locate `X-ZT-Gate: <window> <token>` (case-insensitive) in the header
 /// block.  Returns ((line_start, line_end_incl_crlf), window, token).
+/// Extract the Origin header value from an HTTP header block.
+fn extract_origin(buf: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    loop {
+        let line_end = buf[pos..].windows(2).position(|w| w == b"\r\n")?;
+        let line = &buf[pos..pos + line_end];
+        if line.len() > 7 && line[..7].eq_ignore_ascii_case(b"Origin:") {
+            let val = String::from_utf8_lossy(&line[7..]).trim().to_string();
+            return if val.is_empty() || val == "null" { None } else { Some(val) };
+        }
+        if line.is_empty() { break; }
+        pos += line_end + 2;
+    }
+    None
+}
+
+/// Forward the HTTP response from `server` to `client`, injecting CORS
+/// headers if the backend did not send them.
+async fn forward_response_with_cors<C, S>(
+    client: &mut C,
+    server: &mut S,
+    origin: &Option<String>,
+) -> std::io::Result<()>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut head = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let n = server.read(&mut buf).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "response EOF before headers"));
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 32768 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "response headers too large"));
+        }
+    }
+
+    let has_cors = head.windows(25).any(|w| {
+        w.eq_ignore_ascii_case(b"Access-Control-Allow-Origin")
+    });
+
+    let modified = if has_cors {
+        head
+    } else {
+        let eoh = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let cors_val = origin.as_deref().unwrap_or("*");
+        let mut m = Vec::with_capacity(head.len() + 80);
+        m.extend_from_slice(&head[..eoh]);
+        m.extend_from_slice(b"\r\nAccess-Control-Allow-Origin: ");
+        m.extend_from_slice(cors_val.as_bytes());
+        if origin.is_some() {
+            m.extend_from_slice(b"\r\nAccess-Control-Allow-Credentials: true");
+        }
+        m.extend_from_slice(&head[eoh..]);
+        m
+    };
+
+    client.write_all(&modified).await?;
+
+    let (mut cr, mut cw) = tokio::io::split(client);
+    let (mut sr, mut sw) = tokio::io::split(server);
+    tokio::io::copy(&mut sr, &mut cw).await.ok();
+    tokio::io::copy(&mut cr, &mut sw).await.ok();
+    Ok(())
+}
+
 fn find_gate_header(buf: &[u8]) -> Option<((usize, usize), i64, String)> {
     let mut pos = 0;
     while pos + 2 <= buf.len() {

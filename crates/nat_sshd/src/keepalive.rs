@@ -5,7 +5,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-
+use tracing::debug;
 
 const INTERVAL_NORMAL: Duration = Duration::from_secs(3);
 const INTERVAL_REINFORCE: Duration = Duration::from_secs(1);
@@ -35,10 +35,20 @@ pub async fn run(
 
         match TcpStream::connect(public_addr).await {
             Ok(mut stream) => {
-                let _ = stream.write_all(b"ZTKEEPALIVE1\n").await;
-                drop(stream);
-                retry = interval;
-                let _ = tx.send(Signal::Succeeded).await;
+                // Persistent connection: send heartbeats on this stream until it dies.
+                loop {
+                    if let Err(e) = stream.write_all(b"ZTKEEPALIVE1\n").await {
+                        debug!(error = %e, "keepalive write failed, reconnecting");
+                        break;
+                    }
+                    let _ = tx.send(Signal::Succeeded).await;
+                    retry = interval;
+
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = sleep(interval) => {}
+                    }
+                }
             }
             Err(_) => {
                 retry = (retry * 3 / 2).min(MAX_RETRY);

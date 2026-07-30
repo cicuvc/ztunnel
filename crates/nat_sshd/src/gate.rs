@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -59,25 +59,35 @@ impl Gate {
     }
 
     async fn gate_connection(self: &Arc<Self>, mut stream: TcpStream) -> Result<bool, ()> {
-        let mut line = String::new();
-        {
+        let first_line = {
+            let mut line = String::new();
             let mut reader = BufReader::new(&mut stream);
             timeout(READ_TIMEOUT, reader.read_line(&mut line))
                 .await
                 .map_err(|_| debug!("gate read timeout"))?
                 .map_err(|e| debug!(error = %e, "gate read error"))?;
-        }
+            // Drop reader to release the borrow on stream
+            drop(reader);
+            line
+        };
 
-        let line = line.trim();
+        let trimmed = first_line.trim();
 
-        if line == "ZTKEEPALIVE1" {
-            // Keepalive probe: TCP handshake already refreshed the NAT mapping.
-            // Close silently and do NOT count as a failed auth.
-            debug!("keepalive probe, closing silently");
+        if trimmed == "ZTKEEPALIVE1" {
+            // Persistent keepalive: keep reading heartbeats until EOF.
+            debug!("keepalive persistent connection established");
+            let mut buf = [0u8; 128];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {} // discard heartbeat bytes
+                }
+            }
+            debug!("keepalive connection closed");
             return Ok(false);
         }
 
-        if !self.verify_line(line) {
+        if !self.verify_line(trimmed) {
             debug!("gate token rejected");
             return Err(());
         }

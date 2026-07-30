@@ -2,7 +2,6 @@ mod gate;
 mod keepalive;
 pub mod punch;
 mod register;
-mod relay;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

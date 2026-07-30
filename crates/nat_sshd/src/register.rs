@@ -10,10 +10,6 @@ pub enum RegisterError {
     Http(#[from] reqwest::Error),
     #[error("registry returned {status}: {body}")]
     Unexpected { status: u16, body: String },
-    #[error("registry URL not configured")]
-    NoUrl,
-    #[error("secret not configured")]
-    NoSecret,
 }
 
 pub struct RegistryClient {

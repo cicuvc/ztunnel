@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 use zt_common::token::{self, TokenPurpose};
 
-pub fn run(hostname: &str) -> anyhow::Result<()> {
+pub fn run(_hostname: &str) -> anyhow::Result<()> {
     let secret = crate::config::Config::load_secret()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let cfg = crate::config::Config::load();

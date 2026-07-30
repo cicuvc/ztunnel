@@ -59,6 +59,10 @@ impl RegistryClient {
         }
     }
 
+    pub fn new_handle(&self) -> Self {
+        Self::new(&self.base_url, &self.secret)
+    }
+
     pub async fn register(&self, record: &EndpointRecord) -> Result<(), RegisterError> {
         let window = token::adjusted_window(self.time_offset);
         let token = token::generate(&self.secret, TokenPurpose::Register, window);

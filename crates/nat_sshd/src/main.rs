@@ -9,13 +9,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use zt_common::types::{EndpointRecord, EndpointStatus};
 
 use crate::gate::Gate;
 use crate::punch::PunchConfig;
 use crate::register::RegistryClient;
+
+const SUSPECT_THRESHOLD: u32 = 3;
+const REINFORCE_THRESHOLD: u32 = 1;
+const REGISTER_INTERVAL: Duration = Duration::from_secs(20);
 
 #[tokio::main]
 async fn main() {
@@ -43,16 +48,13 @@ async fn main() {
     let registry_url = std::env::var("REGISTRY_URL")
         .unwrap_or_else(|_| "https://tapi.cicuvc.top".into());
 
-    let config = PunchConfig {
-        local_port,
-        stun_addr: stun_server,
-    };
+    let config = PunchConfig { local_port, stun_addr: stun_server };
 
-    let (listener, mapping) = punch::punch_and_listen(&config)
+    let (mut listener, mapping) = punch::punch_and_listen(&config)
         .await
         .expect("STUN punch failed");
-
-    let public_addr: SocketAddr = SocketAddr::new(mapping.ip.into(), mapping.port);
+    let mut mapping = mapping;
+    let mut public_addr: SocketAddr = SocketAddr::new(mapping.ip.into(), mapping.port);
     info!(%public_addr, "gate listening");
 
     let mut registry = RegistryClient::new(&registry_url, &secret);
@@ -62,39 +64,55 @@ async fn main() {
     let gate = Arc::new(Gate::new(target, &secret, time_offset));
     let shutdown = CancellationToken::new();
 
-    let ka_shutdown = shutdown.child_token();
-    tokio::spawn(keepalive::spawn_hairpin_keepalive(public_addr, ka_shutdown));
-    let record = EndpointRecord {
+    let (ka_tx, mut ka_rx) = mpsc::channel::<keepalive::Signal>(16);
+
+    let mut ka_shutdown = shutdown.child_token();
+    tokio::spawn(keepalive::run(public_addr, ka_tx.clone(), ka_shutdown.child_token(), in_reinforce_window()));
+
+    let mut record = EndpointRecord {
         ip: mapping.ip.to_string(),
         port: mapping.port,
-        ts: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64,
+        ts: unix_now(),
         host_pubkey: load_host_pubkey(),
         status: EndpointStatus::Active,
         nat_type_suspect: false,
     };
 
-    let reg_record = record.clone();
     let reg_shutdown = shutdown.child_token();
-    tokio::spawn(register_loop(registry, reg_record, reg_shutdown));
+    let reg_record = record.clone();
+    tokio::spawn(register_loop(registry.new_handle(), reg_record, reg_shutdown));
 
     info!("accepting connections...");
 
+    let mut failures: u32 = 0;
+
     loop {
         tokio::select! {
-            result = listener.accept() => {
-                match result {
+            conn = listener.accept() => {
+                match conn {
                     Ok((stream, addr)) => {
                         info!(remote = %addr.ip(), "incoming connection");
                         let gate = gate.clone();
-                        tokio::spawn(async move {
-                            gate.handle(stream).await;
-                        });
+                        tokio::spawn(async move { gate.handle(stream).await; });
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept error");
+                    Err(e) => warn!(error = %e, "accept error"),
+                }
+            }
+            Some(signal) = ka_rx.recv() => {
+                match signal {
+                    keepalive::Signal::Failed => {
+                        failures += 1;
+                        let threshold = if in_reinforce_window() { REINFORCE_THRESHOLD } else { SUSPECT_THRESHOLD };
+                        if failures >= threshold {
+                            warn!(failures, "re-punching (suspect state)");
+                            repunch(&config, &mut listener, &mut mapping, &mut public_addr,
+                                    &shutdown, &mut ka_shutdown, &ka_tx,
+                                    &mut registry, &mut record).await;
+                            failures = 0;
+                        }
+                    }
+                    keepalive::Signal::Succeeded => {
+                        failures = 0;
                     }
                 }
             }
@@ -105,6 +123,86 @@ async fn main() {
             }
         }
     }
+}
+
+async fn repunch(
+    config: &PunchConfig,
+    _listener: &mut tokio::net::TcpListener,
+    mapping: &mut zt_common::stun::XorMappedAddress,
+    public_addr: &mut SocketAddr,
+    shutdown: &CancellationToken,
+    ka_shutdown: &mut CancellationToken,
+    ka_tx: &mpsc::Sender<keepalive::Signal>,
+    registry: &mut RegistryClient,
+    record: &mut EndpointRecord,
+) {
+    info!("re-punching NAT hole...");
+
+    // Punch again on the same local port.  SO_REUSEADDR allows the new
+    // STUN socket to bind while the old listener is still active.
+    let (new_listener, new_mapping) = match punch::punch_and_listen(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "re-punch failed, will retry via keepalive");
+            return;
+        }
+    };
+
+    // Keep the OLD listener — it survives because SO_REUSEADDR lets
+    // both sockets coexist.  The NAT now routes to the new mapping.
+    drop(new_listener);
+
+    if new_mapping.port == mapping.port && new_mapping.ip == mapping.ip {
+        info!("mapping unchanged after re-punch");
+        // Still re-register to refresh timestamp
+    } else {
+        info!(
+            old = %public_addr,
+            new = %SocketAddr::new(new_mapping.ip.into(), new_mapping.port),
+            "NAT mapping changed (BRAS reset?)"
+        );
+        *mapping = new_mapping;
+        *public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
+    }
+
+    record.ip = mapping.ip.to_string();
+    record.port = mapping.port;
+    record.ts = unix_now();
+
+    // Re-register immediately
+    match registry.register(record).await {
+        Ok(()) => info!("re-registration succeeded"),
+        Err(e) => warn!(error = %e, "re-registration failed"),
+    }
+
+    // Restart keepalive with the (possibly new) address
+    ka_shutdown.cancel();
+    *ka_shutdown = shutdown.child_token();
+    tokio::spawn(keepalive::run(
+        *public_addr,
+        ka_tx.clone(),
+        ka_shutdown.child_token(),
+        in_reinforce_window(),
+    ));
+
+    info!("re-punch complete, back to ACTIVE");
+}
+
+fn in_reinforce_window() -> bool {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // UTC 17:55–18:20 = CST 01:55–02:20 (BRAS reset window)
+    let day_secs = secs % 86400;
+    day_secs >= 64500 && day_secs <= 66000
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn resolve_v4(addr: &str) -> SocketAddr {
@@ -143,8 +241,6 @@ fn load_secret() -> Result<Vec<u8>, String> {
     if secret.len() != 64 {
         return Err(format!("expected 64 hex chars, got {} chars", secret.len()));
     }
-    // Return the hex string as raw bytes — Node.js side uses the same
-    // hex string directly as the HMAC key.  Both sides must agree.
     Ok(secret.as_bytes().to_vec())
 }
 
@@ -157,10 +253,7 @@ fn secret_path() -> PathBuf {
 
 async fn register_loop(registry: RegistryClient, mut record: EndpointRecord, shutdown: CancellationToken) {
     loop {
-        record.ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        record.ts = unix_now();
 
         match registry.register(&record).await {
             Ok(()) => tracing::debug!("registration successful"),
@@ -168,7 +261,7 @@ async fn register_loop(registry: RegistryClient, mut record: EndpointRecord, shu
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(20)) => {}
+            _ = tokio::time::sleep(REGISTER_INTERVAL) => {}
             _ = shutdown.cancelled() => {
                 info!("register loop stopped");
                 break;

@@ -19,8 +19,8 @@ Environment=TARGET=127.0.0.1:8443
 # DNS A-record updates (Cloudflare).  Token read from CF_TOKEN,
 # CF_TOKEN_FILE, or %h/.config/ztunnel/cf_token ("Key: <token>" format).
 Environment=WEB_DOMAIN=test.cicuvc.top
-Environment=CF_ZONE_ID=your-zone-id
-Environment=CF_RECORD_ID=your-record-id
+Environment=CF_ZONE_ID=ae9649f2546dcc544b0cc03801d6efef
+Environment=CF_RECORD_ID=c5ddc2903e2837b4835547c301e00cf4
 # Environment=CF_TOKEN_FILE=%h/.config/ztunnel/cf_token
 
 [Install]

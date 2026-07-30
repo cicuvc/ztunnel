@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zt_common::types::{EndpointRecord, EndpointStatus};
@@ -50,9 +50,10 @@ async fn main() {
 
     let config = PunchConfig { local_port, stun_addr: stun_server };
 
-    let (mut listener, mapping) = punch::punch_and_listen(&config)
+    let (listener, mapping) = punch::punch_and_listen(&config)
         .await
         .expect("STUN punch failed");
+    let mut listener = Some(listener);
     let mut mapping = mapping;
     let mut public_addr: SocketAddr = SocketAddr::new(mapping.ip.into(), mapping.port);
     info!(%public_addr, "gate listening");
@@ -67,9 +68,9 @@ async fn main() {
     let (ka_tx, mut ka_rx) = mpsc::channel::<keepalive::Signal>(16);
 
     let mut ka_shutdown = shutdown.child_token();
-    tokio::spawn(keepalive::run(public_addr, ka_tx.clone(), ka_shutdown.child_token(), in_reinforce_window()));
+    tokio::spawn(keepalive::run(public_addr, ka_tx.clone(), ka_shutdown.child_token()));
 
-    let mut record = EndpointRecord {
+    let record = EndpointRecord {
         ip: mapping.ip.to_string(),
         port: mapping.port,
         ts: unix_now(),
@@ -78,9 +79,10 @@ async fn main() {
         nat_type_suspect: false,
     };
 
+    let (record_tx, record_rx) = watch::channel(record);
+
     let reg_shutdown = shutdown.child_token();
-    let reg_record = record.clone();
-    tokio::spawn(register_loop(registry.new_handle(), reg_record, reg_shutdown));
+    tokio::spawn(register_loop(registry.new_handle(), record_rx, reg_shutdown));
 
     info!("accepting connections...");
 
@@ -88,7 +90,7 @@ async fn main() {
 
     loop {
         tokio::select! {
-            conn = listener.accept() => {
+            conn = listener.as_mut().unwrap().accept() => {
                 match conn {
                     Ok((stream, addr)) => {
                         info!(remote = %addr.ip(), "incoming connection");
@@ -105,15 +107,57 @@ async fn main() {
                         let threshold = if in_reinforce_window() { REINFORCE_THRESHOLD } else { SUSPECT_THRESHOLD };
                         if failures >= threshold {
                             warn!(failures, "re-punching (suspect state)");
-                            repunch(&config, &mut listener, &mut mapping, &mut public_addr,
-                                    &shutdown, &mut ka_shutdown, &ka_tx,
-                                    &mut registry, &mut record).await;
+
+                            // Close old listener so the new STUN socket can bind
+                            drop(listener.take());
+
+                            match punch::punch_and_listen(&config).await {
+                                Ok((new_l, new_m)) => {
+                                    if new_m.port != mapping.port || new_m.ip != mapping.ip {
+                                        info!(old = %public_addr, new = %SocketAddr::new(new_m.ip.into(), new_m.port), "NAT mapping changed");
+                                    }
+                                    mapping = new_m;
+                                    public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
+                                    listener = Some(new_l);
+
+                                    // Update shared record & re-register
+                                    let mut rec = EndpointRecord {
+                                        ip: mapping.ip.to_string(),
+                                        port: mapping.port,
+                                        ts: unix_now(),
+                                        host_pubkey: load_host_pubkey(),
+                                        status: EndpointStatus::Active,
+                                        nat_type_suspect: false,
+                                    };
+                                    let _ = registry.register(&rec).await;
+                                    rec.ts = unix_now();
+                                    let _ = record_tx.send(rec);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "re-punch failed");
+                                    // The old listener was dropped; re-create one on the same port
+                                    match punch::punch_and_listen(&config).await {
+                                        Ok((l, m)) => {
+                                            mapping = m;
+                                            public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
+                                            listener = Some(l);
+                                        }
+                                        Err(e2) => {
+                                            warn!(error = %e2, "recovery punch also failed");
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Restart keepalive
+                            ka_shutdown.cancel();
+                            ka_shutdown = shutdown.child_token();
+                            tokio::spawn(keepalive::run(public_addr, ka_tx.clone(), ka_shutdown.child_token()));
+
                             failures = 0;
                         }
                     }
-                    keepalive::Signal::Succeeded => {
-                        failures = 0;
-                    }
+                    keepalive::Signal::Succeeded => { failures = 0; }
                 }
             }
             _ = signal::ctrl_c() => {
@@ -125,75 +169,11 @@ async fn main() {
     }
 }
 
-async fn repunch(
-    config: &PunchConfig,
-    _listener: &mut tokio::net::TcpListener,
-    mapping: &mut zt_common::stun::XorMappedAddress,
-    public_addr: &mut SocketAddr,
-    shutdown: &CancellationToken,
-    ka_shutdown: &mut CancellationToken,
-    ka_tx: &mpsc::Sender<keepalive::Signal>,
-    registry: &mut RegistryClient,
-    record: &mut EndpointRecord,
-) {
-    info!("re-punching NAT hole...");
-
-    // Punch again on the same local port.  SO_REUSEADDR allows the new
-    // STUN socket to bind while the old listener is still active.
-    let (new_listener, new_mapping) = match punch::punch_and_listen(config).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "re-punch failed, will retry via keepalive");
-            return;
-        }
-    };
-
-    // Keep the OLD listener — it survives because SO_REUSEADDR lets
-    // both sockets coexist.  The NAT now routes to the new mapping.
-    drop(new_listener);
-
-    if new_mapping.port == mapping.port && new_mapping.ip == mapping.ip {
-        info!("mapping unchanged after re-punch");
-        // Still re-register to refresh timestamp
-    } else {
-        info!(
-            old = %public_addr,
-            new = %SocketAddr::new(new_mapping.ip.into(), new_mapping.port),
-            "NAT mapping changed (BRAS reset?)"
-        );
-        *mapping = new_mapping;
-        *public_addr = SocketAddr::new(mapping.ip.into(), mapping.port);
-    }
-
-    record.ip = mapping.ip.to_string();
-    record.port = mapping.port;
-    record.ts = unix_now();
-
-    // Re-register immediately
-    match registry.register(record).await {
-        Ok(()) => info!("re-registration succeeded"),
-        Err(e) => warn!(error = %e, "re-registration failed"),
-    }
-
-    // Restart keepalive with the (possibly new) address
-    ka_shutdown.cancel();
-    *ka_shutdown = shutdown.child_token();
-    tokio::spawn(keepalive::run(
-        *public_addr,
-        ka_tx.clone(),
-        ka_shutdown.child_token(),
-        in_reinforce_window(),
-    ));
-
-    info!("re-punch complete, back to ACTIVE");
-}
-
 fn in_reinforce_window() -> bool {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // UTC 17:55–18:20 = CST 01:55–02:20 (BRAS reset window)
     let day_secs = secs % 86400;
     day_secs >= 64500 && day_secs <= 66000
 }
@@ -251,7 +231,8 @@ fn secret_path() -> PathBuf {
     PathBuf::from(home).join(".config").join("ztunnel").join("secret")
 }
 
-async fn register_loop(registry: RegistryClient, mut record: EndpointRecord, shutdown: CancellationToken) {
+async fn register_loop(registry: RegistryClient, mut record_rx: watch::Receiver<EndpointRecord>, shutdown: CancellationToken) {
+    let mut record = record_rx.borrow().clone();
     loop {
         record.ts = unix_now();
 
@@ -261,6 +242,10 @@ async fn register_loop(registry: RegistryClient, mut record: EndpointRecord, shu
         }
 
         tokio::select! {
+            _ = record_rx.changed() => {
+                record = record_rx.borrow().clone();
+                tracing::debug!("register_loop: picked up updated endpoint");
+            }
             _ = tokio::time::sleep(REGISTER_INTERVAL) => {}
             _ = shutdown.cancelled() => {
                 info!("register loop stopped");

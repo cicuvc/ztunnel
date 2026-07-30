@@ -22,9 +22,7 @@ pub async fn run(
     public_addr: SocketAddr,
     tx: mpsc::Sender<Signal>,
     shutdown: CancellationToken,
-    reinforce: bool,
 ) {
-    let interval = if reinforce { INTERVAL_REINFORCE } else { INTERVAL_NORMAL };
     let mut retry = INITIAL_RETRY;
 
     loop {
@@ -35,8 +33,10 @@ pub async fn run(
 
         match TcpStream::connect(public_addr).await {
             Ok(mut stream) => {
-                // Persistent connection: send heartbeats on this stream until it dies.
+                // Persistent connection: send heartbeats until the stream dies.
                 loop {
+                    let interval = if in_reinforce_window() { INTERVAL_REINFORCE } else { INTERVAL_NORMAL };
+
                     if let Err(e) = stream.write_all(b"ZTKEEPALIVE1\n").await {
                         debug!(error = %e, "keepalive write failed, reconnecting");
                         break;
@@ -56,4 +56,13 @@ pub async fn run(
             }
         }
     }
+}
+
+fn in_reinforce_window() -> bool {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let day_secs = secs % 86400;
+    day_secs >= 64500 && day_secs <= 66000
 }

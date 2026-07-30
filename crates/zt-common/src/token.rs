@@ -197,4 +197,46 @@ mod tests {
         let expected = (now - 120) / 30;
         assert_eq!(adjusted_window(-120), expected);
     }
+
+    // --- verify_synced ---
+
+    #[test]
+    fn test_verify_synced_exact_match() {
+        let token = generate(TEST_SECRET, TokenPurpose::Gate, 5000);
+        assert!(verify_synced(TEST_SECRET, TokenPurpose::Gate, &token, 5000, 5000));
+    }
+
+    #[test]
+    fn test_verify_synced_client_ahead_one() {
+        let token = generate(TEST_SECRET, TokenPurpose::Gate, 5001);
+        // client_window=5001, server_window=5000 → within ±1
+        assert!(verify_synced(TEST_SECRET, TokenPurpose::Gate, &token, 5001, 5000));
+    }
+
+    #[test]
+    fn test_verify_synced_client_behind_one() {
+        let token = generate(TEST_SECRET, TokenPurpose::Gate, 4999);
+        assert!(verify_synced(TEST_SECRET, TokenPurpose::Gate, &token, 4999, 5000));
+    }
+
+    #[test]
+    fn test_verify_synced_too_far() {
+        let token = generate(TEST_SECRET, TokenPurpose::Gate, 5002);
+        // |5002 - 5000| = 2 > 1 → reject
+        assert!(!verify_synced(TEST_SECRET, TokenPurpose::Gate, &token, 5002, 5000));
+    }
+
+    #[test]
+    fn test_verify_synced_replay_blocked() {
+        // Server window is now 6000, attacker replays a token from window 5000
+        let token = generate(TEST_SECRET, TokenPurpose::Gate, 5000);
+        // |5000 - 6000| = 1000 > 1 → reject even though HMAC is valid
+        assert!(!verify_synced(TEST_SECRET, TokenPurpose::Gate, &token, 5000, 6000));
+    }
+
+    #[test]
+    fn test_verify_synced_wrong_purpose() {
+        let token = generate(TEST_SECRET, TokenPurpose::Register, 5000);
+        assert!(!verify_synced(TEST_SECRET, TokenPurpose::Discover, &token, 5000, 5000));
+    }
 }

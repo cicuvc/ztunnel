@@ -1,0 +1,22 @@
+[Unit]
+Description=ztunnel NAT traversal SSH daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust path to your nat-sshd binary, e.g.:
+#   ExecStart=%h/.cargo/bin/nat-sshd
+#   ExecStart=%h/ztunnel/target/release/nat-sshd
+ExecStart=%h/.local/bin/nat-sshd
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=nat_sshd=info
+Environment=STUN_SERVER=stunserver2025.stunprotocol.org:3478
+Environment=REGISTRY_URL=https://tapi.cicuvc.top
+# Uncomment to override:
+# Environment=LOCAL_PORT=2222
+# Environment=TARGET=127.0.0.1:22
+
+[Install]
+WantedBy=default.target

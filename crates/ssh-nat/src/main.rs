@@ -61,7 +61,7 @@ fn cmd_ssh(user_at_host: &str, ssh_args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("registry error: {}", err);
     }
 
-    let ip = data["ip"]
+    let _ip = data["ip"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing ip"))?;
     let port = data["port"]

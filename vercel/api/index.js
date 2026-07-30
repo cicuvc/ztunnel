@@ -1,4 +1,4 @@
-import { verify, currentWindow } from '../lib/auth.js';
+import { verify, verifySync, currentWindow } from '../lib/auth.js';
 
 const STALE_SECS = 90;
 const EC_API = 'https://api.vercel.com/v1/edge-config';
@@ -100,20 +100,20 @@ async function handleRegister(req, res, secret) {
   }
 
   _endpoint = { ip, port, ts, host_pubkey, status, nat_type_suspect: !!nat_type_suspect };
-  // Persist to Edge Config (best-effort)
-  edgeSet('zt:endpoint', _endpoint);
+  await edgeSet('zt:endpoint', _endpoint);
 
   return res.status(200).json({ ok: true });
 }
 
 async function handleEndpoint(req, res, secret) {
   const { w, t } = req.query;
-  const window = parseInt(w, 10);
-  if (isNaN(window)) {
+  const clientWindow = parseInt(w, 10);
+  if (isNaN(clientWindow)) {
     return res.status(400).json({ error: 'invalid window' });
   }
 
-  if (!verify(secret, 'discover', t, window)) {
+  const serverWindow = currentWindow();
+  if (!verifySync(secret, 'discover', t, clientWindow, serverWindow)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 

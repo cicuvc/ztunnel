@@ -30,12 +30,31 @@ export async function verify(
   secret: string,
   purpose: string,
   token: string,
-  window: number,
+  serverWindow: number,
 ): Promise<boolean> {
   if (!token || token.length !== TOKEN_CHARS) return false;
 
   for (let offset = -WINDOW_TOLERANCE; offset <= WINDOW_TOLERANCE; offset++) {
-    const candidate = await generate(secret, purpose, window + offset);
+    const candidate = await generate(secret, purpose, serverWindow + offset);
+    if (timingSafeEqual(token, candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function verifySync(
+  secret: string,
+  purpose: string,
+  token: string,
+  clientWindow: number,
+  serverWindow: number,
+): Promise<boolean> {
+  if (!token || token.length !== TOKEN_CHARS) return false;
+  if (Math.abs(clientWindow - serverWindow) > WINDOW_TOLERANCE) return false;
+
+  for (let offset = -WINDOW_TOLERANCE; offset <= WINDOW_TOLERANCE; offset++) {
+    const candidate = await generate(secret, purpose, serverWindow + offset);
     if (timingSafeEqual(token, candidate)) {
       return true;
     }

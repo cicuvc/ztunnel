@@ -1,4 +1,4 @@
-import { verify, currentWindow } from "./lib/auth.ts";
+import { verify, verifySync, currentWindow } from "./lib/auth.ts";
 
 const STALE_SECS = 90;
 const KV_KEY = ["zt", "endpoint"];
@@ -111,12 +111,13 @@ async function handleEndpoint(req: Request, secret: string): Promise<Response> {
     return json({ error: "missing w or t parameter" }, 400);
   }
 
-  const window = parseInt(w, 10);
-  if (isNaN(window)) {
+  const clientWindow = parseInt(w, 10);
+  if (isNaN(clientWindow)) {
     return json({ error: "invalid window" }, 400);
   }
 
-  if (!await verify(secret, "discover", t, window)) {
+  const serverWindow = currentWindow();
+  if (!await verifySync(secret, "discover", t, clientWindow, serverWindow)) {
     return json({ error: "unauthorized" }, 401);
   }
 

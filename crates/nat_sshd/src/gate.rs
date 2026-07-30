@@ -109,13 +109,14 @@ impl Gate {
             return false;
         }
 
-        let window: i64 = match parts[1].parse() {
+        let client_window: i64 = match parts[1].parse() {
             Ok(w) => w,
             Err(_) => return false,
         };
 
         let token = parts[2];
-        token::verify(&self.secret, TokenPurpose::Gate, token, window)
+        let server_window = token::adjusted_window(self.time_offset);
+        token::verify_synced(&self.secret, TokenPurpose::Gate, token, client_window, server_window)
     }
 
     async fn is_banned(&self, ip: IpAddr) -> bool {

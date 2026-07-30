@@ -66,7 +66,35 @@ pub fn generate(secret: &[u8], purpose: TokenPurpose, window: i64) -> String {
 pub fn verify(secret: &[u8], purpose: TokenPurpose, token: &str, window: i64) -> bool {
     for offset in -WINDOW_TOLERANCE..=WINDOW_TOLERANCE {
         let candidate = generate(secret, purpose, window + offset);
-        // constant-time comparison
+        use subtle::ConstantTimeEq;
+        let eq = token.as_bytes().ct_eq(candidate.as_bytes());
+        if eq.into() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Anti-replay verify: bound the token to the server's clock.
+/// `client_window` is the window the client claims; `server_window` is what
+/// the verifier computes from its own clock (+ time_offset).
+/// The client window must be within ±1 of the server window (freshness check).
+/// The actual HMAC comparison is done against `server_window` (not client_window),
+/// so a captured token cannot be replayed beyond the server's window shift.
+pub fn verify_synced(
+    secret: &[u8],
+    purpose: TokenPurpose,
+    token: &str,
+    client_window: i64,
+    server_window: i64,
+) -> bool {
+    if (client_window - server_window).abs() > WINDOW_TOLERANCE {
+        return false;
+    }
+    // Verify using server_window — the client should have generated the token
+    // with a window close enough to the server's window.
+    for offset in -WINDOW_TOLERANCE..=WINDOW_TOLERANCE {
+        let candidate = generate(secret, purpose, server_window + offset);
         use subtle::ConstantTimeEq;
         let eq = token.as_bytes().ct_eq(candidate.as_bytes());
         if eq.into() {

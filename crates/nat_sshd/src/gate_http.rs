@@ -301,14 +301,15 @@ where
 
     client.write_all(&modified).await?;
 
-    // Forward the body: bytes already read in head + remaining Content-Length.
+    // Forward the remaining body.  NOTE: `modified` above already included
+    // the body bytes that were read together with the headers (via
+    // `&head[eoh..]`), so only forward what is still missing.
     let mut remaining_body = content_length.saturating_sub(body_part.len() as u64);
-    if !body_part.is_empty() {
-        client.write_all(body_part).await?;
-    }
+    tracing::debug!(content_length, body_part = body_part.len(), remaining_body, "forwarding response body");
     while remaining_body > 0 {
         let want = (remaining_body.min(8192)) as usize;
         let n = server.read(&mut buf[..want]).await?;
+        tracing::debug!(n, want, "read body chunk");
         if n == 0 {
             break;
         }
@@ -322,10 +323,13 @@ where
 
 fn parse_content_length(headers: &[u8]) -> u64 {
     let mut pos = 0;
-    while pos + 2 <= headers.len() {
+    loop {
+        // Find the end of this header line.  The last line is followed by
+        // "\r\n\r\n" (the terminator), so it has no trailing "\r\n" within
+        // the header slice — treat the remainder as the last line.
         let line_end = match headers[pos..].windows(2).position(|w| w == b"\r\n") {
             Some(i) => i,
-            None => break,
+            None => headers.len() - pos,
         };
         let line = &headers[pos..pos + line_end];
         if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
@@ -333,6 +337,9 @@ fn parse_content_length(headers: &[u8]) -> u64 {
             if let Ok(n) = val.parse::<u64>() {
                 return n;
             }
+        }
+        if pos + line_end + 2 > headers.len() {
+            break;
         }
         pos += line_end + 2;
     }

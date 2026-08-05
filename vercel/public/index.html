@@ -8,12 +8,18 @@
   html, body { background: #fff; margin: 0; padding: 0; }
 </style>
 <script>
-// Minimal landing page: register the proxy SW, then go straight to /vp_main.
-// The SW's clients.claim() makes it control this page, so the redirect
-// request is intercepted and proxied to the NAT backend.
+// Minimal landing page: register the proxy SW, then return to the
+// originally-requested path.  Vercel rewrites unknown paths to "/", but
+// the browser URL keeps the deep link (e.g. /vp_main/posts/...), so
+// location.pathname preserves it across an SW (re)registration.
 (function () {
-  if (location.search.includes('bootstrap')) {
-    location.replace('/vp_main?bootstrap=1');
+  var orig = location.pathname + location.search;
+  var isRoot = orig === '/' || orig === '/index.html' || orig === '';
+  // Default landing target; deep links stay where they were.
+  var target = isRoot ? '/vp_main' : orig;
+
+  if (location.search.indexOf('bootstrap') !== -1) {
+    location.replace(target);
     return;
   }
   if (!('serviceWorker' in navigator)) {
@@ -21,19 +27,18 @@
     return;
   }
   navigator.serviceWorker.register('/sw.js', { scope: '/' })
-    .then(() => navigator.serviceWorker.ready)
-    .then(reg => {
+    .then(function () { return navigator.serviceWorker.ready; })
+    .then(function (reg) {
       if (reg.active) reg.active.postMessage({ type: 'refresh-config' });
       if (navigator.serviceWorker.controller) {
-        location.replace('/vp_main');
+        location.replace(target);
       } else {
-        navigator.serviceWorker.addEventListener('controllerchange', () => {
-          location.replace('/vp_main');
+        navigator.serviceWorker.addEventListener('controllerchange', function () {
+          location.replace(target);
         }, { once: true });
       }
     })
-    .catch(() => {
-      // SW failed; fall back to the registry host so users can still reach it.
+    .catch(function () {
       location.replace('https://tapi.cicuvc.top/?bootstrap=1');
     });
 })();

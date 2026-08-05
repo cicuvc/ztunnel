@@ -1,1 +1,8 @@
-{}
+{
+  "rewrites": [
+    {
+      "source": "/((?!api|sw\\.js).*)",
+      "destination": "/"
+    }
+  ]
+}

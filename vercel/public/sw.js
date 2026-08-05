@@ -90,7 +90,11 @@ async function doFetch(url, method, headers, body) {
     headers,
     body,
     duplex: 'half',
-    redirect: 'manual',
+    // Follow backend redirects (e.g. / -> /vp_main).  With 'manual' a
+    // cross-origin 3xx becomes an opaque-redirect (status 0) that the
+    // browser cannot navigate.  The redirect target is same-origin to the
+    // backend URL, so the X-ZT-Gate header is preserved through the fetch.
+    redirect: 'follow',
   });
   const clean = new Headers(resp.headers);
   for (const h of ['access-control-allow-origin', 'access-control-allow-methods',

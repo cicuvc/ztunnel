@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Same binary as nat-sshd, parameterized by environment:
-ExecStart=%h/.local/bin/nat-sshd
+ExecStart=%h/cs/projects/ztunnel/target/release/nat-sshd
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=nat_sshd=info
@@ -15,20 +15,13 @@ Environment=REGISTRY_URL=https://tapi.cicuvc.top
 Environment=SERVICE=web
 Environment=GATE_MODE=header
 Environment=LOCAL_PORT=8443
-# TARGET is a PLAIN HTTP app on localhost — the daemon terminates TLS
-# itself (the gate header lives inside the TLS stream, so the local app
-# cannot terminate TLS for this design to work).
-Environment=TARGET=127.0.0.1:8080
-# TLS cert served to browsers (must cover WEB_DOMAIN).  Defaults to
-# /etc/letsencrypt/live/$WEB_DOMAIN/{fullchain,privkey}.pem
-# Environment=TLS_CERT=/etc/letsencrypt/live/test.cicuvc.top/fullchain.pem
-# Environment=TLS_KEY=/etc/letsencrypt/live/test.cicuvc.top/privkey.pem
-# DNS A-record updates (Cloudflare).  Token read from CF_TOKEN,
-# CF_TOKEN_FILE, or %h/.config/ztunnel/cf_token ("Key: <token>" format).
+Environment=TARGET=127.0.0.1:44456
 Environment=WEB_DOMAIN=test.cicuvc.top
+Environment=TLS_CERT=%h/cs/projects/ztunnel/research/cbot/live/cicuvc.top/fullchain.pem
+Environment=TLS_KEY=%h/cs/projects/ztunnel/research/cbot/live/cicuvc.top/privkey.pem
 Environment=CF_ZONE_ID=ae9649f2546dcc544b0cc03801d6efef
 Environment=CF_RECORD_ID=c5ddc2903e2837b4835547c301e00cf4
-# Environment=CF_TOKEN_FILE=%h/.config/ztunnel/cf_token
+Environment=CF_TOKEN_FILE=%h/.config/ztunnel/cf_token
 
 [Install]
 WantedBy=default.target

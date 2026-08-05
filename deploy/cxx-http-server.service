@@ -1,0 +1,15 @@
+[Unit]
+Description=cxx_server blog HTTP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/cs/projects/cxx_server
+ExecStart=%h/cs/projects/cxx_server/build/linux/x86_64/release/http_server
+Restart=always
+RestartSec=5
+Environment=PORT=44456
+
+[Install]
+WantedBy=default.target

@@ -41,7 +41,10 @@ self.addEventListener('message', e => {
 self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (u.origin !== self.location.origin) return;
-  if (u.pathname === '/sw.js' || u.pathname.startsWith('/api')) return;
+  if (u.pathname === '/sw.js') return;
+  // Only the bare /api registry endpoint is internal to ztunnel.
+  // Backend app routes like /api/articles, /api/test, /api/blob must proxy.
+  if (u.pathname === '/api' || u.pathname === '/api/') return;
   if (u.search.includes('bootstrap')) return;
   e.respondWith(proxy(e.request));
 });
@@ -89,7 +92,6 @@ async function doFetch(url, method, headers, body) {
     duplex: 'half',
     redirect: 'manual',
   });
-  // Strip CORS headers — the SW returns within the same origin.
   const clean = new Headers(resp.headers);
   for (const h of ['access-control-allow-origin', 'access-control-allow-methods',
                    'access-control-allow-headers', 'access-control-max-age',
@@ -104,9 +106,10 @@ async function doFetch(url, method, headers, body) {
 }
 
 function bootstrapPage(msg) {
-  const html = '<!DOCTYPE html><html><body style="font-family:system-ui;background:#111;color:#eee;max-width:640px;margin:60px auto;padding:20px">'
-    + '<h1 style="color:#f80">ztunnel</h1><p>' + msg + '</p>'
-    + '<p><a style="color:#6cf" href="javascript:location.reload()">重试</a> · '
-    + '<a style="color:#6cf" href="/?bootstrap=1">重新引导</a></p></body></html>';
+  // Show more detail for debugging
+  const html = `<!DOCTYPE html><html><body style="font-family:system-ui;background:#111;color:#eee;max-width:640px;margin:60px auto;padding:20px">
+<h1 style="color:#f80">ztunnel</h1><p>${msg}</p>
+<p style="color:#888;font-size:0.85em">config: ${cfg ? cfg.url : 'null'}</p>
+<p><a style="color:#6cf" href="javascript:location.reload()">重试</a> · <a style="color:#6cf" href="/?bootstrap=1">直接访问</a></p></body></html>`;
   return new Response(html, { status: 502, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }

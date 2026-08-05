@@ -236,6 +236,10 @@ fn extract_origin(buf: &[u8]) -> Option<String> {
 
 /// Forward the HTTP response from `server` to `client`, injecting CORS
 /// headers if the backend did not send them.
+///
+/// Reads exactly Content-Length body bytes so a keep-alive backend
+/// (which does not close the connection after one response) does not
+/// cause the gate to hang waiting for EOF.
 async fn forward_response_with_cors<C, S>(
     client: &mut C,
     server: &mut S,
@@ -246,50 +250,93 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let mut head = Vec::with_capacity(4096);
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 8192];
+    let eoh; // offset of "\r\n\r\n"
 
     loop {
         let n = server.read(&mut buf).await?;
         if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "response EOF before headers"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "response EOF before headers",
+            ));
         }
         head.extend_from_slice(&buf[..n]);
-        if head.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if head.len() > 32768 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "response headers too large"));
+        match head.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(p) => { eoh = p; break; }
+            None => {
+                if head.len() > 32768 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "response headers too large",
+                    ));
+                }
+            }
         }
     }
 
-    let has_cors = head.windows(25).any(|w| {
+    // Parse Content-Length so we only forward the exact body bytes.
+    let content_length = parse_content_length(&head[..eoh]);
+
+    let has_cors = head.windows(27).any(|w| {
         w.eq_ignore_ascii_case(b"Access-Control-Allow-Origin")
     });
 
-    let modified = if has_cors {
-        head
-    } else {
-        let eoh = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let body_part = &head[eoh + 4..];
+
+    // Insert CORS header BEFORE the \r\n\r\n terminator (i.e. in the header block).
+    let mut modified = Vec::with_capacity(head.len() + 80);
+    modified.extend_from_slice(&head[..eoh]);
+    if !has_cors {
         let cors_val = origin.as_deref().unwrap_or("*");
-        let mut m = Vec::with_capacity(head.len() + 80);
-        m.extend_from_slice(&head[..eoh]);
-        m.extend_from_slice(b"\r\nAccess-Control-Allow-Origin: ");
-        m.extend_from_slice(cors_val.as_bytes());
+        modified.extend_from_slice(b"\r\nAccess-Control-Allow-Origin: ");
+        modified.extend_from_slice(cors_val.as_bytes());
         if origin.is_some() {
-            m.extend_from_slice(b"\r\nAccess-Control-Allow-Credentials: true");
+            modified.extend_from_slice(b"\r\nAccess-Control-Allow-Credentials: true");
         }
-        m.extend_from_slice(&head[eoh..]);
-        m
-    };
+    }
+    modified.extend_from_slice(&head[eoh..]); // \r\n\r\n + any body bytes already read
 
     client.write_all(&modified).await?;
 
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let (mut sr, mut sw) = tokio::io::split(server);
-    tokio::io::copy(&mut sr, &mut cw).await.ok();
-    tokio::io::copy(&mut cr, &mut sw).await.ok();
+    // Forward the body: bytes already read in head + remaining Content-Length.
+    let mut remaining_body = content_length.saturating_sub(body_part.len() as u64);
+    if !body_part.is_empty() {
+        client.write_all(body_part).await?;
+    }
+    while remaining_body > 0 {
+        let want = (remaining_body.min(8192)) as usize;
+        let n = server.read(&mut buf[..want]).await?;
+        if n == 0 {
+            break;
+        }
+        client.write_all(&buf[..n]).await?;
+        remaining_body -= n as u64;
+    }
+
+    // No client→server copy: an idle GET must not block the gate.
     Ok(())
+}
+
+fn parse_content_length(headers: &[u8]) -> u64 {
+    let mut pos = 0;
+    while pos + 2 <= headers.len() {
+        let line_end = match headers[pos..].windows(2).position(|w| w == b"\r\n") {
+            Some(i) => i,
+            None => break,
+        };
+        let line = &headers[pos..pos + line_end];
+        if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+            let val: String = line[15..].iter().map(|&b| b as char).filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = val.parse::<u64>() {
+                return n;
+            }
+        }
+        pos += line_end + 2;
+    }
+    0
 }
 
 fn find_gate_header(buf: &[u8]) -> Option<((usize, usize), i64, String)> {

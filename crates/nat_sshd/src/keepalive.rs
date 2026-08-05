@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+// NAT TCP mapping idle timeout is ~5-8s.  Keepalive must fire before that.
 const INTERVAL_NORMAL: Duration = Duration::from_secs(3);
 const INTERVAL_REINFORCE: Duration = Duration::from_secs(1);
 const INITIAL_RETRY: Duration = Duration::from_millis(300);
@@ -18,6 +18,11 @@ pub enum Signal {
     Failed,
 }
 
+/// Connect-then-close keepalive.  The TCP handshake's SYN-ACK from the
+/// listener port (8443) is outbound traffic through the NAT mapping, which
+/// refreshes the idle timer.  We intentionally send no payload: a persistent
+/// connection does not survive the HTTP gate (it demands TLS + HTTP
+/// headers), so we simply re-establish the handshake on an interval.
 pub async fn run(
     public_addr: SocketAddr,
     tx: mpsc::Sender<Signal>,
@@ -32,23 +37,10 @@ pub async fn run(
         }
 
         match TcpStream::connect(public_addr).await {
-            Ok(mut stream) => {
-                // Persistent connection: send heartbeats until the stream dies.
-                loop {
-                    let interval = if in_reinforce_window() { INTERVAL_REINFORCE } else { INTERVAL_NORMAL };
-
-                    if let Err(e) = stream.write_all(b"ZTKEEPALIVE1\n").await {
-                        debug!(error = %e, "keepalive write failed, reconnecting");
-                        break;
-                    }
-                    let _ = tx.send(Signal::Succeeded).await;
-                    retry = interval;
-
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = sleep(interval) => {}
-                    }
-                }
+            Ok(stream) => {
+                drop(stream); // handshake already refreshed the mapping
+                retry = if in_reinforce_window() { INTERVAL_REINFORCE } else { INTERVAL_NORMAL };
+                let _ = tx.send(Signal::Succeeded).await;
             }
             Err(_) => {
                 retry = (retry * 3 / 2).min(MAX_RETRY);

@@ -3,40 +3,42 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ztunnel</title>
+<title>Redirecting…</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 20px; background: #111; color: #eee; }
-  h1 { color: #0f0; }
-  pre { background: #222; padding: 15px; border-radius: 8px; white-space: pre-wrap; }
-  a { color: #6cf; }
+  html, body { background: #fff; margin: 0; padding: 0; }
 </style>
-</head>
-<body>
-<h1>ztunnel</h1>
-<pre id="s">Initializing...</pre>
-<p><small><a href="/?bootstrap=1" id="bypass">直接访问</a></small></p>
 <script>
-document.getElementById('s').textContent = '';
-
-if (location.search.includes('bootstrap')) {
-  document.getElementById('s').textContent = 'Bootstrap mode — SW bypassed.';
-} else if (!('serviceWorker' in navigator)) {
-  document.getElementById('s').textContent = 'Service Worker not supported.';
-} else {
-  // Fetch config first so the SW has it immediately on activation.
-  fetch('/api?cmd=web-config', { cache: 'no-store' })
-    .catch(() => null)
-    .then(() => navigator.serviceWorker.register('/sw.js', { scope: '/' }))
+// Minimal landing page: register the proxy SW, then go straight to /vp_main.
+// The SW's clients.claim() makes it control this page, so the redirect
+// request is intercepted and proxied to the NAT backend.
+(function () {
+  if (location.search.includes('bootstrap')) {
+    location.replace('/vp_main?bootstrap=1');
+    return;
+  }
+  if (!('serviceWorker' in navigator)) {
+    location.href = 'https://tapi.cicuvc.top/?bootstrap=1';
+    return;
+  }
+  navigator.serviceWorker.register('/sw.js', { scope: '/' })
     .then(() => navigator.serviceWorker.ready)
     .then(reg => {
-      reg.active.postMessage({ type: 'refresh-config' });
-      // Reload — the SW intercepts and returns the backend content.
-      location.reload();
+      if (reg.active) reg.active.postMessage({ type: 'refresh-config' });
+      if (navigator.serviceWorker.controller) {
+        location.replace('/vp_main');
+      } else {
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          location.replace('/vp_main');
+        }, { once: true });
+      }
     })
-    .catch(e => {
-      document.getElementById('s').textContent = 'SW init failed: ' + e.message;
+    .catch(() => {
+      // SW failed; fall back to the registry host so users can still reach it.
+      location.replace('https://tapi.cicuvc.top/?bootstrap=1');
     });
-}
+})();
 </script>
+</head>
+<body>
 </body>
 </html>

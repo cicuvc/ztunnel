@@ -6,8 +6,9 @@ const EC_API = 'https://api.vercel.com/v1/edge-config';
 // In-memory cache per service; Edge Config is the durable store.
 const _endpoints = {};
 
+// Edge Config keys allow only [A-Za-z0-9_-]; colons are rejected.
 function edgeKey(service) {
-  return `zt:endpoint:${service}`;
+  return `zt-endpoint-${service}`;
 }
 
 async function edgeGet(key) {

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -11,6 +11,10 @@ const INTERVAL_NORMAL: Duration = Duration::from_secs(3);
 const INTERVAL_REINFORCE: Duration = Duration::from_secs(1);
 const INITIAL_RETRY: Duration = Duration::from_millis(300);
 const MAX_RETRY: Duration = Duration::from_secs(5);
+// A dead mapping makes the hairpin SYN be silently dropped by the NAT; the
+// plain connect would block until the OS TCP timeout (~2 min).  Bound it so
+// a dead mapping yields a fast failure → repunch instead of a silent hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub enum Signal {
@@ -36,13 +40,19 @@ pub async fn run(
             _ = sleep(retry) => {}
         }
 
-        match TcpStream::connect(public_addr).await {
-            Ok(stream) => {
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(public_addr)).await {
+            Ok(Ok(stream)) => {
                 drop(stream); // handshake already refreshed the mapping
                 retry = if in_reinforce_window() { INTERVAL_REINFORCE } else { INTERVAL_NORMAL };
                 let _ = tx.send(Signal::Succeeded).await;
             }
+            Ok(Err(e)) => {
+                debug!(error = %e, "keepalive connect failed");
+                retry = (retry * 3 / 2).min(MAX_RETRY);
+                let _ = tx.send(Signal::Failed).await;
+            }
             Err(_) => {
+                debug!("keepalive connect timed out");
                 retry = (retry * 3 / 2).min(MAX_RETRY);
                 let _ = tx.send(Signal::Failed).await;
             }

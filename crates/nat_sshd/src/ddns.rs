@@ -37,17 +37,28 @@ fn load_cf_token() -> Option<String> {
             PathBuf::from(home).join(".config").join("ztunnel").join("cf_token")
         });
     let content = std::fs::read_to_string(&path).ok()?;
+    token_from_content(&content)
+}
+
+/// Parse a CF token from file content: prefer a `Key:` line, else the first
+/// bare (no-colon) non-empty, non-comment line.  Labels like `Account: ...`
+/// and example blocks are skipped.
+fn token_from_content(content: &str) -> Option<String> {
     for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("Key:") {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Key:") {
             let t = rest.trim();
             if !t.is_empty() {
                 return Some(t.to_string());
             }
+        } else if !trimmed.contains(':') {
+            // Bare token line (no "key:" prefix) — accept it.
+            return Some(trimmed.to_string());
         }
-        let t = line.trim();
-        if !t.is_empty() && !t.starts_with('#') {
-            return Some(t.to_string());
-        }
+        // Lines like "Account: ..." or "======== Example ========" are skipped.
     }
     None
 }
@@ -87,5 +98,34 @@ pub async fn update_a_record(config: &DdnsConfig, ip: Ipv4Addr) {
         Err(e) => {
             warn!(error = %e, "DNS update request failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_key_line() {
+        let content = "Account: abc123\nKey: realtoken123\n\n==== Example ====\ncurl ... Bearer realtoken123\n";
+        assert_eq!(token_from_content(content).as_deref(), Some("realtoken123"));
+    }
+
+    #[test]
+    fn loads_bare_token_line() {
+        assert_eq!(token_from_content("realtoken456\n").as_deref(), Some("realtoken456"));
+    }
+
+    #[test]
+    fn does_not_misread_account_line() {
+        // Regression: fallback used to return "Account: ..." as the token.
+        let content = "Account: 5b56358842553e7b84fa3890dae7944c\nKey: cfat_realkey\n";
+        assert_eq!(token_from_content(content).as_deref(), Some("cfat_realkey"));
+    }
+
+    #[test]
+    fn ignores_example_block() {
+        let content = "Account: abc\nKey: tok\n\n==== Example ====\ncurl -H \"Authorization: Bearer tok\"\n";
+        assert_eq!(token_from_content(content).as_deref(), Some("tok"));
     }
 }
